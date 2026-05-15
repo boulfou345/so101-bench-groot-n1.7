@@ -9,6 +9,7 @@ import numpy as np
 
 import isaaclab.sim as sim_utils
 from isaaclab.assets import ArticulationCfg, AssetBaseCfg, RigidObjectCfg
+from isaaclab.assets import DeformableObjectCfg
 from isaaclab.envs import ManagerBasedRLEnvCfg
 from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import ObservationGroupCfg as ObsGroup
@@ -39,12 +40,12 @@ OBJECT_LABELS = ["white pen", "black pen", "blue pen", "red pen"]
 TABLE_BOUNDS = {"x": (-10.0, 10.0), "y": (-10.0, 10.0)}
 BIN_FIXED_TRANSLATION = (-0.04424, -0.69022, 1.04161)
 BIN_FIXED_YAW_DEG = -79.392
-BIN_ROOT_ROTATION_RPY_DEG = (90.0, 0.0, 0.0)
+BIN_ROOT_ROTATION_RPY_DEG = (0.0, 0.0, 0.0)
 BIN_FIXED_POSE = (BIN_FIXED_TRANSLATION[0], BIN_FIXED_TRANSLATION[1], math.radians(BIN_FIXED_YAW_DEG))
 OBJECT_FIXED_POSES = (
     (-0.22312, -0.80442, math.radians(90.0)),
-    (-0.47272, -0.70795, math.radians(90.0)),
     (-0.36156, -0.82500, math.radians(90.0)),
+    (-0.47272, -0.70795, math.radians(90.0)),
     (-0.49656, -0.82500, math.radians(90.0)),
 )
 BIN_X_RANGE = (-0.34, -0.26)
@@ -265,6 +266,16 @@ def _object_spawn(
     size: tuple[float, float, float],
     mass: float = 0.035,
 ) -> sim_utils.CuboidCfg:
+    """
+    object_4 = RigidObjectCfg(
+        prim_path="{ENV_REGEX_NS}/Object_4",
+        spawn=_object_spawn((0.90, 0.16, 0.10), (0.095, 0.014, 0.014), mass=0.020),
+        init_state=RigidObjectCfg.InitialStateCfg(
+            pos=(OBJECT_FIXED_POSES[3][0], OBJECT_FIXED_POSES[3][1], 1.07)
+        ),
+    )
+    """
+
     return sim_utils.CuboidCfg(
         size=size,
         rigid_props=sim_utils.RigidBodyPropertiesCfg(
@@ -342,7 +353,7 @@ class So101BenchSceneCfg(InteractiveSceneCfg):
     object_1 = RigidObjectCfg(
         prim_path="{ENV_REGEX_NS}/Object_1",
         spawn=sim_utils.UsdFileCfg(
-            usd_path=f"{ASSETS_PATH}/usd/objects/blue_bowl.usd",
+            usd_path=f"{ASSETS_PATH}/usd/objects/blue_bowl.usdc",
             rigid_props=sim_utils.RigidBodyPropertiesCfg(
                 solver_position_iteration_count=32,
                 solver_velocity_iteration_count=4,
@@ -395,11 +406,33 @@ class So101BenchSceneCfg(InteractiveSceneCfg):
 
     object_4 = RigidObjectCfg(
         prim_path="{ENV_REGEX_NS}/Object_4",
-        spawn=_object_spawn((0.90, 0.16, 0.10), (0.095, 0.014, 0.014), mass=0.020),
+        spawn=sim_utils.UsdFileCfg(
+            usd_path=f"{ASSETS_PATH}/usd/objects/black_tape.usdc",
+            rigid_props=sim_utils.RigidBodyPropertiesCfg(
+                solver_position_iteration_count=32,
+                solver_velocity_iteration_count=4,
+                max_depenetration_velocity=0.5,
+            ),
+            collision_props=sim_utils.CollisionPropertiesCfg(
+                collision_enabled=True,
+            ),
+        ),
         init_state=RigidObjectCfg.InitialStateCfg(
-            pos=(OBJECT_FIXED_POSES[3][0], OBJECT_FIXED_POSES[3][1], 1.07)
+            pos=(OBJECT_FIXED_POSES[3][0], OBJECT_FIXED_POSES[3][1], 1.04294)
         ),
     )
+
+    # object_4 = DeformableObjectCfg(
+    #     prim_path="{ENV_REGEX_NS}/Object_4",
+    #     spawn=sim_utils.UsdFileCfg(
+    #         usd_path=f"{ASSETS_PATH}/usd/objects/brown_stuffed_animal.usdc",
+    #     ),
+    #     init_state=DeformableObjectCfg.InitialStateCfg(
+    #         pos=(OBJECT_FIXED_POSES[3][0], OBJECT_FIXED_POSES[3][1], 1.07),
+    #         rot=(1.0, 0.0, 0.0, 0.0),
+    #     ),
+    #     debug_vis=False,
+    # )
 
     camera_wrist = _camera_cfg(
         width=INNOMAKER_WRIST_CAMERA_WIDTH,
@@ -423,8 +456,8 @@ class So101BenchSceneCfg(InteractiveSceneCfg):
         vertical_aperture=None,
     )
     camera_overhead.prim_path = "{ENV_REGEX_NS}/CameraOverhead"
-    camera_overhead.offset.pos = (-0.11342, -0.41946, 1.58316)
-    camera_overhead.offset.rot = (0.176819, 0.084379, 0.417046, 0.887518)
+    camera_overhead.offset.pos = (-0.11906, -0.49921, 1.51802)
+    camera_overhead.offset.rot = (0.174550, 0.088979, 0.440136, 0.876297)
     camera_overhead.offset.convention = "opengl"
 
     # bedroom_rear_light = AssetBaseCfg(
@@ -453,10 +486,10 @@ class So101BenchSceneCfg(InteractiveSceneCfg):
     bedroom_domelight = AssetBaseCfg(
         prim_path="{ENV_REGEX_NS}/BedroomDomeLight",
         spawn=sim_utils.DomeLightCfg(
-            intensity=800,
-            color=(1.0, 0.92, 0.78),
+            intensity=600,
+            color=(1.0, 0.96, 0.88),
             enable_color_temperature=True,
-            color_temperature=7500,
+            color_temperature=6500,
         ),
     )
 
@@ -610,7 +643,7 @@ class So101BenchEnvCfg(ManagerBasedRLEnvCfg):
 
     def __post_init__(self) -> None:
         self.decimation = CONTROL_DECIMATION
-        self.episode_length_s = 20.0
+        self.episode_length_s = 120.0
         self.scene.num_envs = 1
         self.sim.dt = PHYSICS_DT
         self.sim.render_interval = self.decimation

@@ -10,7 +10,7 @@ from pxr import Sdf, Usd, UsdGeom, UsdPhysics
 
 import isaaclab.sim as sim_utils
 import isaaclab.utils.math as math_utils
-from isaaclab.assets import Articulation, RigidObject
+from isaaclab.assets import Articulation, DeformableObject, RigidObject
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.sim import get_current_stage
 
@@ -27,7 +27,7 @@ from so101_bench.benchmark import (
 )
 
 ROBOT_COLORS = {
-    "orange": (0.876, 0.317, 0.132),
+    "orange": (0.95, 0.15, 0.02),
     "teal": (0.0, 0.8, 0.502),
     "white": (0.95, 0.95, 0.95),
     "black": (0.08, 0.08, 0.08),
@@ -209,19 +209,40 @@ def _bin_quat(yaw: float, root_rotation: tuple[float, float, float], device: str
 
 def _write_pose(
     env,
-    asset: RigidObject | Articulation,
+    asset: RigidObject | Articulation | DeformableObject,
     env_id: int,
     pos: tuple[float, float, float],
     quat: torch.Tensor,
 ):
     env_ids = torch.tensor([env_id], dtype=torch.long, device=asset.device)
+    root_pos_w = torch.tensor(pos, dtype=torch.float32, device=asset.device).unsqueeze(0)
+    root_pos_w += env.scene.env_origins[env_ids]
+
+    if isinstance(asset, DeformableObject):
+        nodal_state = asset.data.default_nodal_state_w[env_ids].clone()
+        default_root_pos_w = nodal_state[..., :3].mean(dim=1)
+        translation = root_pos_w - default_root_pos_w
+        nodal_state[..., :3] = asset.transform_nodal_pos(
+            nodal_state[..., :3],
+            pos=translation,
+            quat=quat.to(asset.device).unsqueeze(0),
+        )
+        nodal_state[..., 3:] = 0.0
+        asset.write_nodal_state_to_sim(nodal_state, env_ids=env_ids)
+        return root_pos_w[0]
+
     root_pose = torch.zeros((1, 7), device=asset.device)
-    root_pose[:, :3] = torch.tensor(pos, dtype=torch.float32, device=asset.device)
-    root_pose[:, :3] += env.scene.env_origins[env_ids]
+    root_pose[:, :3] = root_pos_w
     root_pose[:, 3:7] = quat.to(asset.device).unsqueeze(0)
     asset.write_root_pose_to_sim(root_pose, env_ids=env_ids)
     asset.write_root_velocity_to_sim(torch.zeros((1, 6), device=asset.device), env_ids=env_ids)
     return root_pose[0, :3]
+
+
+def _default_root_z(asset: RigidObject | Articulation | DeformableObject, env_id: int) -> float:
+    if isinstance(asset, DeformableObject):
+        return float(asset.data.default_nodal_state_w[env_id, :, 2].mean().item())
+    return float(asset.data.default_root_state[env_id, 2].item())
 
 
 def reset_benchmark_scene(
@@ -286,7 +307,7 @@ def reset_benchmark_scene(
     env.so101_bench_episodes = []
 
     bin_asset: RigidObject = env.scene[bin_name]
-    object_assets: list[RigidObject] = [env.scene[name] for name in object_asset_names]
+    object_assets: list[RigidObject | DeformableObject] = [env.scene[name] for name in object_asset_names]
 
     for env_id_tensor in env_ids:
         env_id = int(env_id_tensor.item())
@@ -331,7 +352,7 @@ def reset_benchmark_scene(
         env._so101_failure_bin_pos_w[env_id] = env._so101_initial_bin_pos_w[env_id]
 
         for object_id, asset in enumerate(object_assets):
-            default_z = float(asset.data.default_root_state[env_id, 2].item())
+            default_z = _default_root_z(asset, env_id)
             if object_id < active_count:
                 x, y = sampled_positions[object_id]
                 z = default_z if default_z > table_top_z else table_top_z + 0.025
