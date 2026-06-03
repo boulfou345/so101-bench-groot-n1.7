@@ -18,7 +18,8 @@ def ee_frame_state(
     """Return the end-effector frame pose in the robot root frame."""
 
     robot = env.scene[robot_cfg.name]
-    robot_root_pos, robot_root_quat = robot.data.root_pos_w, robot.data.root_quat_w
+    robot_root_pos = robot.data.root_pos_w
+    robot_root_quat = robot.data.root_quat_w
     ee_frame: FrameTransformer = env.scene[ee_frame_cfg.name]
     ee_frame_pos = ee_frame.data.target_pos_w[:, 0, :]
     ee_frame_quat = ee_frame.data.target_quat_w[:, 0, :]
@@ -37,4 +38,3 @@ def image_raw(
 
     sensor = env.scene[sensor_cfg.name]
     return sensor.data.output[data_type].clone()
-

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import random
+from pathlib import Path
 
 import torch
 from pxr import Gf, Sdf, Usd, UsdGeom, UsdPhysics
@@ -26,6 +27,7 @@ from so101_bench.benchmark import (
     TASK_MIXED,
     TASK_MOVE,
     TASK_NEXT_TO,
+    load_object_move_footprint_boxes,
     object_rigid_body_child_names,
     task_instruction,
 )
@@ -60,6 +62,8 @@ def _env_ids_tensor(env, env_ids: torch.Tensor | None) -> torch.Tensor:
 BenchmarkObject = RigidObject | Articulation | DeformableObject | XformPrimView
 BinPose = tuple[tuple[float, float, float], tuple[float, float, float]]
 DEFAULT_HALF_EXTENTS = (0.02, 0.02, 0.02)
+DEFAULT_FOOTPRINT_HALF_EXTENTS = (0.02, 0.02)
+DEFAULT_FOOTPRINT_CENTER_OFFSET = (0.0, 0.0)
 
 
 def benchmark_object_positions(env, object_asset_names: list[str]) -> torch.Tensor:
@@ -97,7 +101,46 @@ def benchmark_object_positions(env, object_asset_names: list[str]) -> torch.Tens
     return torch.stack(positions, dim=1)
 
 
-def _prim_bbox_half_extents(stage: Usd.Stage, bbox_cache: UsdGeom.BBoxCache, prim_path: str) -> tuple[float, float, float]:
+def benchmark_object_yaws(env, object_asset_names: list[str]) -> torch.Tensor:
+    yaws = []
+    multi_info = getattr(env, "_so101_multi_rigid_body_info", {}) or {}
+    for name in object_asset_names:
+        asset = env.scene[name]
+        if isinstance(asset, XformPrimView):
+            views = multi_info.get(name)
+            if views:
+                view_info = views[0]
+                transforms = view_info["view"].get_transforms()
+                if not isinstance(transforms, torch.Tensor):
+                    transforms = torch.as_tensor(transforms)
+                transforms = transforms.to(env.device)
+                child_quat_xyzw = transforms[..., 3:7]
+                child_quat_wxyz = math_utils.convert_quat(child_quat_xyzw, to="wxyz")
+                local_quat_inv = math_utils.quat_inv(
+                    view_info["local_quat"].to(env.device).expand_as(child_quat_wxyz)
+                )
+                wrapper_quat = math_utils.quat_mul(child_quat_wxyz, local_quat_inv)
+                yaws.append(_quat_yaw(wrapper_quat))
+            else:
+                quat = asset.get_world_poses()[1]
+                if not isinstance(quat, torch.Tensor):
+                    quat = torch.as_tensor(quat)
+                yaws.append(_quat_yaw(quat.to(env.device)))
+        else:
+            yaws.append(_quat_yaw(asset.data.root_quat_w))
+    return torch.stack(yaws, dim=1)
+
+
+def _quat_yaw(quat_wxyz: torch.Tensor) -> torch.Tensor:
+    w, x, y, z = quat_wxyz.unbind(dim=-1)
+    return torch.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+
+
+def _prim_bbox_half_extents(
+    stage: Usd.Stage,
+    bbox_cache: UsdGeom.BBoxCache,
+    prim_path: str,
+) -> tuple[float, float, float]:
     prim = stage.GetPrimAtPath(prim_path)
     if not prim.IsValid():
         return DEFAULT_HALF_EXTENTS
@@ -120,13 +163,75 @@ def _scene_half_extents(env, asset_name: str, bbox_cache: UsdGeom.BBoxCache, sta
     return torch.tensor(extents, dtype=torch.float32, device=env.device)
 
 
+def _coerce_footprint_pair(
+    raw_value,
+    fallback: tuple[float, float],
+    *,
+    min_value: float | None = None,
+) -> tuple[float, float]:
+    if isinstance(raw_value, torch.Tensor):
+        raw_value = raw_value.detach().cpu().tolist()
+    if not isinstance(raw_value, (list, tuple)) or len(raw_value) < 2:
+        return fallback
+    first = float(raw_value[0])
+    second = float(raw_value[1])
+    if min_value is not None:
+        first = max(first, min_value)
+        second = max(second, min_value)
+    if not math.isfinite(first) or not math.isfinite(second):
+        return fallback
+    return (first, second)
+
+
+def _usd_footprint(
+    usd_path: str | Path | None,
+    fallback_half_extents: tuple[float, float] = DEFAULT_FOOTPRINT_HALF_EXTENTS,
+) -> tuple[tuple[float, float], tuple[float, float]]:
+    if usd_path is None:
+        return fallback_half_extents, DEFAULT_FOOTPRINT_CENTER_OFFSET
+    try:
+        stage = Usd.Stage.Open(str(usd_path))
+        if stage is None:
+            raise RuntimeError(f"could not open {usd_path}")
+        prim = stage.GetDefaultPrim()
+        if prim is None or not prim.IsValid():
+            prim = stage.GetPseudoRoot()
+        bbox_cache = UsdGeom.BBoxCache(
+            Usd.TimeCode.Default(),
+            [UsdGeom.Tokens.default_, UsdGeom.Tokens.render, UsdGeom.Tokens.proxy],
+        )
+        bbox_range = bbox_cache.ComputeWorldBound(prim).ComputeAlignedRange()
+        minimum = bbox_range.GetMin()
+        maximum = bbox_range.GetMax()
+        half_extents = (
+            max(0.5 * abs(float(maximum[0] - minimum[0])), 0.002),
+            max(0.5 * abs(float(maximum[1] - minimum[1])), 0.002),
+        )
+        center_offset = (
+            0.5 * (float(minimum[0]) + float(maximum[0])),
+            0.5 * (float(minimum[1]) + float(maximum[1])),
+        )
+        if not all(math.isfinite(value) for value in (*half_extents, *center_offset)):
+            raise RuntimeError(f"non-finite footprint for {usd_path}")
+        return half_extents, center_offset
+    except Exception:
+        return fallback_half_extents, DEFAULT_FOOTPRINT_CENTER_OFFSET
+
+
+def _asset_usd_path(env, asset_name: str) -> str | None:
+    asset_cfg = getattr(env.scene.cfg, asset_name, None)
+    spawn_cfg = getattr(asset_cfg, "spawn", None)
+    usd_path = getattr(spawn_cfg, "usd_path", None)
+    return str(usd_path) if usd_path is not None else None
+
+
 def _record_benchmark_geometry(
     env,
     object_asset_names: list[str],
     bin_name: str,
     object_labels: list[str] | None = None,
 ) -> None:
-    """Cache per-slot AABB half-extents used by surface and containment checks."""
+    """Cache per-slot AABB and USD footprint geometry used by task checks."""
 
     stage = get_current_stage()
     bbox_cache = UsdGeom.BBoxCache(Usd.TimeCode.Default(), [UsdGeom.Tokens.default_])
@@ -135,6 +240,55 @@ def _record_benchmark_geometry(
         dim=1,
     )
     env._so101_bin_half_extents = _scene_half_extents(env, bin_name, bbox_cache, stage)
+    object_footprints = [
+        _usd_footprint(
+            _asset_usd_path(env, asset_name),
+            _coerce_footprint_pair(
+                env._so101_object_half_extents[:, object_id, :2].amax(dim=0),
+                DEFAULT_FOOTPRINT_HALF_EXTENTS,
+                min_value=0.002,
+            ),
+        )
+        for object_id, asset_name in enumerate(object_asset_names)
+    ]
+    env._so101_object_footprint_half_extents = torch.tensor(
+        [footprint[0] for footprint in object_footprints],
+        dtype=torch.float32,
+        device=env.device,
+    ).unsqueeze(0).repeat(env.num_envs, 1, 1)
+    env._so101_object_footprint_center_offsets = torch.tensor(
+        [footprint[1] for footprint in object_footprints],
+        dtype=torch.float32,
+        device=env.device,
+    ).unsqueeze(0).repeat(env.num_envs, 1, 1)
+    env._so101_object_move_footprint_boxes = [
+        torch.tensor(
+            load_object_move_footprint_boxes(object_label, required=False),
+            dtype=torch.float32,
+            device=env.device,
+        ).reshape(-1, 4)
+        if object_labels is not None and object_id < len(object_labels)
+        else torch.empty((0, 4), dtype=torch.float32, device=env.device)
+        for object_id, object_label in enumerate(object_labels or object_asset_names)
+    ]
+    bin_footprint_half, bin_footprint_offset = _usd_footprint(
+        _asset_usd_path(env, bin_name),
+        _coerce_footprint_pair(
+            env._so101_bin_half_extents[:, :2].amax(dim=0),
+            DEFAULT_FOOTPRINT_HALF_EXTENTS,
+            min_value=0.002,
+        ),
+    )
+    env._so101_bin_footprint_half_extents = torch.tensor(
+        bin_footprint_half,
+        dtype=torch.float32,
+        device=env.device,
+    ).unsqueeze(0).repeat(env.num_envs, 1)
+    env._so101_bin_footprint_center_offsets = torch.tensor(
+        bin_footprint_offset,
+        dtype=torch.float32,
+        device=env.device,
+    ).unsqueeze(0).repeat(env.num_envs, 1)
     _ensure_multi_rigid_body_views(env, object_asset_names, object_labels)
 
 
@@ -236,6 +390,7 @@ def _ensure_multi_rigid_body_views(
             views.append(
                 {
                     "view": view,
+                    "rel_path": record["rel_path"],
                     "local_pos": torch.tensor(record["local_pos"], dtype=torch.float32, device=env.device),
                     "local_quat": torch.tensor(record["local_quat_wxyz"], dtype=torch.float32, device=env.device),
                 }
@@ -376,6 +531,10 @@ def _required_object_count(task_family: str, object_count_range: tuple[int, int]
         low = max(low, 4)
     elif task_family == TASK_BETWEEN:
         low = max(low, 4)
+    elif task_family == TASK_MOVE:
+        if low > 4 or high < 4:
+            raise ValueError(f"Move tasks need four active objects, got range {object_count_range}.")
+        return 4
     high = max(high, low)
     return random.randint(low, high)
 
@@ -621,6 +780,34 @@ def _layout_bin_pose(
     )
 
 
+def _reset_tensor_rows(
+    env,
+    name: str,
+    shape: tuple[int, ...],
+    dtype: torch.dtype,
+    env_ids: torch.Tensor,
+    fill_value: float | int | bool,
+) -> torch.Tensor:
+    value = getattr(env, name, None)
+    if not isinstance(value, torch.Tensor) or tuple(value.shape) != shape:
+        value = torch.full(shape, fill_value, dtype=dtype, device=env.device)
+        setattr(env, name, value)
+    else:
+        value[env_ids] = fill_value
+    return value
+
+
+def _reset_list_rows(env, name: str, env_ids: torch.Tensor, fill_value):
+    values = getattr(env, name, None)
+    if not isinstance(values, list) or len(values) != env.num_envs:
+        values = [fill_value for _ in range(env.num_envs)]
+        setattr(env, name, values)
+    else:
+        for env_id in env_ids.tolist():
+            values[env_id] = fill_value
+    return values
+
+
 def reset_benchmark_scene(
     env,
     env_ids: torch.Tensor,
@@ -670,36 +857,116 @@ def reset_benchmark_scene(
     num_objects = len(object_asset_names)
     device = env.device
 
-    env._so101_task_family = [TASK_BIN for _ in range(num_envs)]
-    env._so101_instruction_text = ["" for _ in range(num_envs)]
-    env._so101_active_object_mask = torch.zeros((num_envs, num_objects), dtype=torch.bool, device=device)
-    env._so101_target_object_ids = torch.zeros(num_envs, dtype=torch.long, device=device)
-    env._so101_referent_object_ids = torch.zeros((num_envs, 2), dtype=torch.long, device=device)
-    env._so101_direction_ids = torch.zeros(num_envs, dtype=torch.long, device=device)
-    env._so101_initial_object_pos_w = torch.zeros((num_envs, num_objects, 3), dtype=torch.float32, device=device)
-    env._so101_initial_bin_pos_w = torch.zeros((num_envs, 3), dtype=torch.float32, device=device)
-    env._so101_failure_object_pos_w = torch.zeros((num_envs, num_objects, 3), dtype=torch.float32, device=device)
-    env._so101_failure_bin_pos_w = torch.zeros((num_envs, 3), dtype=torch.float32, device=device)
-    env._so101_failure_baseline_recorded = torch.zeros(num_envs, dtype=torch.bool, device=device)
-    env._so101_robot_started_moving = torch.zeros(num_envs, dtype=torch.bool, device=device)
-    env._so101_robot_start_step = torch.full((num_envs,), -1, dtype=torch.long, device=device)
-    env._so101_robot_start_time_s = torch.full((num_envs,), float("nan"), dtype=torch.float32, device=device)
-    env._so101_grasp_attempt_counts = torch.zeros((num_envs, num_objects), dtype=torch.long, device=device)
+    env._so101_task_family = _reset_list_rows(env, "_so101_task_family", env_ids, TASK_BIN)
+    env._so101_instruction_text = _reset_list_rows(env, "_so101_instruction_text", env_ids, "")
+    env._so101_active_object_mask = _reset_tensor_rows(
+        env, "_so101_active_object_mask", (num_envs, num_objects), torch.bool, env_ids, False
+    )
+    env._so101_target_object_ids = _reset_tensor_rows(
+        env, "_so101_target_object_ids", (num_envs,), torch.long, env_ids, 0
+    )
+    env._so101_referent_object_ids = _reset_tensor_rows(
+        env, "_so101_referent_object_ids", (num_envs, 2), torch.long, env_ids, 0
+    )
+    env._so101_direction_ids = _reset_tensor_rows(
+        env, "_so101_direction_ids", (num_envs,), torch.long, env_ids, 0
+    )
+    env._so101_initial_object_pos_w = _reset_tensor_rows(
+        env, "_so101_initial_object_pos_w", (num_envs, num_objects, 3), torch.float32, env_ids, 0.0
+    )
+    env._so101_initial_object_yaws = _reset_tensor_rows(
+        env, "_so101_initial_object_yaws", (num_envs, num_objects), torch.float32, env_ids, 0.0
+    )
+    env._so101_initial_bin_pos_w = _reset_tensor_rows(
+        env, "_so101_initial_bin_pos_w", (num_envs, 3), torch.float32, env_ids, 0.0
+    )
+    env._so101_initial_bin_yaws = _reset_tensor_rows(
+        env, "_so101_initial_bin_yaws", (num_envs,), torch.float32, env_ids, 0.0
+    )
+    env._so101_bin_pose_indices = _reset_tensor_rows(
+        env, "_so101_bin_pose_indices", (num_envs,), torch.long, env_ids, -1
+    )
+    env._so101_failure_object_pos_w = _reset_tensor_rows(
+        env, "_so101_failure_object_pos_w", (num_envs, num_objects, 3), torch.float32, env_ids, 0.0
+    )
+    env._so101_failure_bin_pos_w = _reset_tensor_rows(
+        env, "_so101_failure_bin_pos_w", (num_envs, 3), torch.float32, env_ids, 0.0
+    )
+    env._so101_failure_baseline_recorded = _reset_tensor_rows(
+        env, "_so101_failure_baseline_recorded", (num_envs,), torch.bool, env_ids, False
+    )
+    env._so101_robot_started_moving = _reset_tensor_rows(
+        env, "_so101_robot_started_moving", (num_envs,), torch.bool, env_ids, False
+    )
+    env._so101_robot_start_step = _reset_tensor_rows(
+        env, "_so101_robot_start_step", (num_envs,), torch.long, env_ids, -1
+    )
+    env._so101_robot_start_time_s = _reset_tensor_rows(
+        env, "_so101_robot_start_time_s", (num_envs,), torch.float32, env_ids, float("nan")
+    )
+    env._so101_grasp_attempt_counts = _reset_tensor_rows(
+        env, "_so101_grasp_attempt_counts", (num_envs, num_objects), torch.long, env_ids, 0
+    )
     env._so101_max_grasp_attempts = MAX_GRASP_ATTEMPTS
-    env._so101_grasp_armed = torch.zeros(num_envs, dtype=torch.bool, device=device)
-    env._so101_grasp_arm_jaw_pos = None
-    env._so101_bin_success_counter = torch.zeros(num_envs, dtype=torch.long, device=device)
-    env._so101_next_to_success_counter = torch.zeros(num_envs, dtype=torch.long, device=device)
-    env._so101_between_success_counter = torch.zeros(num_envs, dtype=torch.long, device=device)
-    env._so101_move_success_counter = torch.zeros(num_envs, dtype=torch.long, device=device)
-    env.so101_bench_episodes = []
-    for cache_name in ("_so101_move_boundary_coords", "_so101_move_boundary_ids"):
+    env._so101_grasp_armed = _reset_tensor_rows(
+        env, "_so101_grasp_armed", (num_envs,), torch.bool, env_ids, False
+    )
+    env._so101_grasped_object_ids = _reset_tensor_rows(
+        env, "_so101_grasped_object_ids", (num_envs,), torch.long, env_ids, -1
+    )
+    grasp_arm_jaw_pos = getattr(env, "_so101_grasp_arm_jaw_pos", None)
+    if isinstance(grasp_arm_jaw_pos, torch.Tensor) and tuple(grasp_arm_jaw_pos.shape) == (num_envs,):
+        grasp_arm_jaw_pos[env_ids] = 0.0
+    else:
+        env._so101_grasp_arm_jaw_pos = None
+    env._so101_bin_success_counter = _reset_tensor_rows(
+        env, "_so101_bin_success_counter", (num_envs,), torch.long, env_ids, 0
+    )
+    env._so101_next_to_success_counter = _reset_tensor_rows(
+        env, "_so101_next_to_success_counter", (num_envs,), torch.long, env_ids, 0
+    )
+    env._so101_between_success_counter = _reset_tensor_rows(
+        env, "_so101_between_success_counter", (num_envs,), torch.long, env_ids, 0
+    )
+    env._so101_move_success_counter = _reset_tensor_rows(
+        env, "_so101_move_success_counter", (num_envs,), torch.long, env_ids, 0
+    )
+    env._so101_timeout_success_confirmation_active = _reset_tensor_rows(
+        env, "_so101_timeout_success_confirmation_active", (num_envs,), torch.bool, env_ids, False
+    )
+    env._so101_timeout_success_confirmation_failed = _reset_tensor_rows(
+        env, "_so101_timeout_success_confirmation_failed", (num_envs,), torch.bool, env_ids, False
+    )
+    env._so101_grasped_object_contact_steps = _reset_tensor_rows(
+        env, "_so101_grasped_object_contact_steps", (num_envs,), torch.long, env_ids, 0
+    )
+    env._so101_grasped_object_contact_last_episode_steps = _reset_tensor_rows(
+        env, "_so101_grasped_object_contact_last_episode_steps", (num_envs,), torch.long, env_ids, -1
+    )
+    env.so101_bench_episodes = _reset_list_rows(env, "so101_bench_episodes", env_ids, {})
+    for cache_name in (
+        "_so101_move_boundary_coords",
+        "_so101_move_boundary_ids",
+        "_so101_grasped_object_made_contact_override",
+        "_so101_termination_step_state_cache",
+    ):
         if hasattr(env, cache_name):
             delattr(env, cache_name)
 
     bin_asset: RigidObject = env.scene[bin_name]
     object_assets: list[BenchmarkObject] = [env.scene[name] for name in object_asset_names]
-    _record_benchmark_geometry(env, object_asset_names, bin_name, object_labels)
+    geometry_signature = (tuple(object_asset_names), tuple(object_labels), bin_name)
+    if getattr(env, "_so101_benchmark_geometry_signature", None) != geometry_signature:
+        _record_benchmark_geometry(env, object_asset_names, bin_name, object_labels)
+        env._so101_default_object_footprint_half_extents = env._so101_object_footprint_half_extents.clone()
+        env._so101_default_object_footprint_center_offsets = env._so101_object_footprint_center_offsets.clone()
+        env._so101_default_bin_footprint_half_extents = env._so101_bin_footprint_half_extents.clone()
+        env._so101_default_bin_footprint_center_offsets = env._so101_bin_footprint_center_offsets.clone()
+        env._so101_benchmark_geometry_signature = geometry_signature
+    env._so101_object_footprint_half_extents[env_ids] = env._so101_default_object_footprint_half_extents[env_ids]
+    env._so101_object_footprint_center_offsets[env_ids] = env._so101_default_object_footprint_center_offsets[env_ids]
+    env._so101_bin_footprint_half_extents[env_ids] = env._so101_default_bin_footprint_half_extents[env_ids]
+    env._so101_bin_footprint_center_offsets[env_ids] = env._so101_default_bin_footprint_center_offsets[env_ids]
     layout_objects = _layout_object_entries(episode_layout)
     layout_bin_pose = _layout_bin_pose(episode_layout)
 
@@ -730,17 +997,43 @@ def reset_benchmark_scene(
 
         bin_pos = (bin_fixed_pose[0], bin_fixed_pose[1], bin_z)
         bin_quat = _bin_quat(bin_fixed_pose[2], bin_root_rotation, device)
+        bin_yaw = bin_fixed_pose[2] + bin_root_rotation[2]
         selected_bin_pose_index: int | None = None
         if layout_bin_pose is not None:
             bin_pos, bin_rpy = layout_bin_pose
             bin_quat = _rpy_quat(bin_rpy, device)
+            bin_yaw = bin_rpy[2]
             layout_bin_entry = episode_layout.get("bin") if isinstance(episode_layout, dict) else None
             if isinstance(layout_bin_entry, dict) and "pose_index" in layout_bin_entry:
                 selected_bin_pose_index = int(layout_bin_entry["pose_index"])
+            if isinstance(layout_bin_entry, dict):
+                env._so101_bin_footprint_half_extents[env_id] = torch.tensor(
+                    _coerce_footprint_pair(
+                        layout_bin_entry.get("footprint_half_extents") or layout_bin_entry.get("half_extents"),
+                        tuple(env._so101_bin_footprint_half_extents[env_id].tolist()),
+                        min_value=0.002,
+                    ),
+                    dtype=torch.float32,
+                    device=device,
+                )
+                env._so101_bin_footprint_center_offsets[env_id] = torch.tensor(
+                    _coerce_footprint_pair(
+                        layout_bin_entry.get("footprint_center_offset") or layout_bin_entry.get("center_offset"),
+                        tuple(env._so101_bin_footprint_center_offsets[env_id].tolist()),
+                    ),
+                    dtype=torch.float32,
+                    device=device,
+                )
         elif selected_task == TASK_BIN and randomize_bin_for_bin_task and bin_random_poses:
             selected_bin_pose_index = random.randrange(len(bin_random_poses))
             bin_pos, bin_rpy = bin_random_poses[selected_bin_pose_index]
             bin_quat = _rpy_quat(bin_rpy, device)
+            bin_yaw = bin_rpy[2]
+        elif selected_task == TASK_MOVE and bin_random_poses:
+            selected_bin_pose_index = 0
+            bin_pos, bin_rpy = bin_random_poses[selected_bin_pose_index]
+            bin_quat = _rpy_quat(bin_rpy, device)
+            bin_yaw = bin_rpy[2]
 
         using_fixed_object_poses = False
         if episode_layout is not None:
@@ -813,15 +1106,35 @@ def reset_benchmark_scene(
             bin_pos,
             bin_quat,
         )
+        env._so101_initial_bin_yaws[env_id] = bin_yaw
+        env._so101_bin_pose_indices[env_id] = -1 if selected_bin_pose_index is None else selected_bin_pose_index
         env._so101_failure_bin_pos_w[env_id] = env._so101_initial_bin_pos_w[env_id]
 
         for object_id, asset in enumerate(object_assets):
+            is_active = object_id in active_object_order
             default_z = _default_root_z(asset, env_id)
-            if object_id in active_object_order:
+            if is_active:
                 layout_entry = layout_objects.get(object_id)
                 if layout_entry is not None:
                     x, y, z = _layout_object_position(layout_entry)
                     yaw = _layout_object_yaw(layout_entry)
+                    env._so101_object_footprint_half_extents[env_id, object_id] = torch.tensor(
+                        _coerce_footprint_pair(
+                            layout_entry.get("footprint_half_extents") or layout_entry.get("half_extents"),
+                            tuple(env._so101_object_footprint_half_extents[env_id, object_id].tolist()),
+                            min_value=0.002,
+                        ),
+                        dtype=torch.float32,
+                        device=device,
+                    )
+                    env._so101_object_footprint_center_offsets[env_id, object_id] = torch.tensor(
+                        _coerce_footprint_pair(
+                            layout_entry.get("footprint_center_offset") or layout_entry.get("center_offset"),
+                            tuple(env._so101_object_footprint_center_offsets[env_id, object_id].tolist()),
+                        ),
+                        dtype=torch.float32,
+                        device=device,
+                    )
                 else:
                     pose_id = active_object_order[object_id]
                     x, y = sampled_positions[pose_id]
@@ -843,6 +1156,7 @@ def reset_benchmark_scene(
                 _yaw_quat(yaw, device),
                 asset_name=object_asset_names[object_id],
             )
+            env._so101_initial_object_yaws[env_id, object_id] = yaw
             env._so101_failure_object_pos_w[env_id, object_id] = env._so101_initial_object_pos_w[
                 env_id, object_id
             ]
@@ -854,19 +1168,17 @@ def reset_benchmark_scene(
         else:
             instruction = task_instruction(selected_task, active_labels, direction)
         env._so101_instruction_text[env_id] = instruction
-        env.so101_bench_episodes.append(
-            {
-                "env_id": env_id,
-                "task_family": selected_task,
-                "instruction": instruction,
-                "active_object_count": active_count,
-                "active_object_ids": active_object_ids,
-                "active_asset_names": [object_asset_names[object_id] for object_id in active_object_ids],
-                "active_labels": active_labels,
-                "bin_pose_index": selected_bin_pose_index,
-                "direction": direction if selected_task == TASK_MOVE else None,
-                "metadata": dict(episode_spec.get("metadata", {})) if episode_spec is not None else {},
-            }
-        )
+        env.so101_bench_episodes[env_id] = {
+            "env_id": env_id,
+            "task_family": selected_task,
+            "instruction": instruction,
+            "active_object_count": active_count,
+            "active_object_ids": active_object_ids,
+            "active_asset_names": [object_asset_names[object_id] for object_id in active_object_ids],
+            "active_labels": active_labels,
+            "bin_pose_index": selected_bin_pose_index,
+            "direction": direction if selected_task == TASK_MOVE else None,
+            "metadata": dict(episode_spec.get("metadata", {})) if episode_spec is not None else {},
+        }
 
-    env.so101_bench_instruction = env._so101_instruction_text[int(env_ids[0].item())]
+    env.so101_bench_instruction = env._so101_instruction_text[0]

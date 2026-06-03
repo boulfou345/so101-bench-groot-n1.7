@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import math
 from pathlib import Path
 import re
 from typing import Any
@@ -32,7 +33,27 @@ NON_TARGET_DISPLACEMENT_LIMIT_M = 0.5 * INCH
 BOUNDARY_DISPLACEMENT_LIMIT_M = 0.5 * INCH
 SPATIAL_SUCCESS_DISTANCE_M = 2.0 * INCH
 BETWEEN_LINE_TOLERANCE_M = 1.5 * INCH
-ON_TOP_VERTICAL_TOLERANCE_M = 0.5 * INCH
+MOVE_BOUNDARY_SUCCESS_DISTANCE_M = 2.0 * INCH
+MOVE_NO_BOUNDARY_MIN_PROGRESS_M = 2.0 * INCH
+MOVE_STRAIGHTNESS_TOLERANCE_M = 2.0 * INCH
+# Footprints come from collision meshes, so an object resting *against* a boundary
+# overlaps it by a few millimetres. Treat penetration up to this as "touching": it
+# keeps move success and the move_past_boundary failure complementary (no dead zone).
+MOVE_PAST_BOUNDARY_TOLERANCE_M = 0.5 * INCH
+# A nearest object only counts as the move boundary if it blocks at least this fraction
+# of the target's lateral corridor. Below it the object is merely beside the path (a
+# glancing clip), so the move is scored on forward progress instead of "reaching" it.
+MOVE_BOUNDARY_MIN_LATERAL_OVERLAP_FRACTION = 0.1
+DEFAULT_EPISODE_LENGTH_S = 25.0
+FOUR_OBJECT_BIN_EPISODE_LENGTH_S = 90.0
+
+
+def episode_length_s(task_family: str, object_count: int) -> float:
+    """Return the timeout for one benchmark episode."""
+
+    if task_family == TASK_BIN and object_count == 4:
+        return FOUR_OBJECT_BIN_EPISODE_LENGTH_S
+    return DEFAULT_EPISODE_LENGTH_S
 
 # Each object has an indication for whether its USD contains multiple rigid bodies
 # In that case, the object cannot be initialized with RigidObjectCfg and must use AssetBaseCfg instead
@@ -64,7 +85,7 @@ OBJECT_SPLITS: dict[str, dict[str, dict[str, bool]]] = {
         "blue scissors": {"multiple_rigid_bodies": False},
     },
     "unseen_seen_class": {
-        "orange glasses": {"multiple_rigid_bodies": False},
+        # "orange glasses": {"multiple_rigid_bodies": False},
         "white glasses": {"multiple_rigid_bodies": False},
         "blue clip": {"multiple_rigid_bodies": False},
         "blue tape": {"multiple_rigid_bodies": False},
@@ -105,6 +126,11 @@ BENCHMARK_OBJECT_NAMES: tuple[str, ...] = tuple(
 OBJECT_METADATA: dict[str, dict[str, bool]] = {
     object_name: metadata for split in OBJECT_SPLITS.values() for object_name, metadata in split.items()
 }
+MOVE_FOOTPRINT_SCHEMA_VERSION = 1
+MOVE_FOOTPRINT_GENERATOR_COMMAND = (
+    "/home/truman/env_isaaclab/bin/python scripts/generate_object_move_footprints.py"
+)
+OBJECT_MOVE_FOOTPRINT_DIR = Path(__file__).resolve().parent / "assets" / "objects"
 
 FAILURE_TAXONOMY: dict[str, tuple[str, ...]] = {
     "shared_grasp_acquisition": (
@@ -136,22 +162,23 @@ FAILURE_TAXONOMY: dict[str, tuple[str, ...]] = {
         "placed next to other object",
         "placed next to class distractor",
         "placed next to color distractor",
-        "placed on top",
+        "made contact",
         "not close enough",
         "drove/rammed into object",
     ),
     "between": (
         "semantic error",
-        "placed on top",
+        "made contact",
         "not centered enough",
         "too close to referent",
         "not close",
     ),
     "move": (
         "not close enough to boundary",
-        "not straight enough",
+        "trajectory not straight enough",
         "moved boundary",
         "moved past boundary",
+        "made contact",
     ),
 }
 
@@ -223,6 +250,83 @@ def object_usd_stem(object_name: str) -> str:
 
     object_metadata(object_name)
     return object_name.replace(" ", "_")
+
+
+def object_move_footprint_path(object_name: str) -> Path:
+    """Return the generated move-task footprint metadata path for an object."""
+
+    return OBJECT_MOVE_FOOTPRINT_DIR / f"{object_usd_stem(object_name)}.json"
+
+
+def load_object_move_footprint_boxes(
+    object_name: str,
+    *,
+    required: bool = True,
+) -> tuple[tuple[float, float, float, float], ...]:
+    """Load raster-derived local XY rectangles for move-task geometry."""
+
+    path = object_move_footprint_path(object_name)
+    if not path.is_file():
+        if required:
+            raise ValueError(
+                f"Missing generated move-task footprint metadata for {object_name!r}: {path}. "
+                f"Run `{MOVE_FOOTPRINT_GENERATOR_COMMAND}`."
+            )
+        return ()
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(
+            f"Could not read generated move-task footprint metadata for {object_name!r}: {path}. "
+            f"Run `{MOVE_FOOTPRINT_GENERATOR_COMMAND}`."
+        ) from exc
+    if not isinstance(payload, dict) or payload.get("schema_version") != MOVE_FOOTPRINT_SCHEMA_VERSION:
+        raise ValueError(
+            f"Generated move-task footprint metadata for {object_name!r} has an unsupported schema: {path}. "
+            f"Run `{MOVE_FOOTPRINT_GENERATOR_COMMAND}`."
+        )
+    raw_boxes = payload.get("boxes")
+    if not isinstance(raw_boxes, list) or not raw_boxes:
+        raise ValueError(
+            f"Generated move-task footprint metadata for {object_name!r} has no boxes: {path}. "
+            f"Run `{MOVE_FOOTPRINT_GENERATOR_COMMAND}`."
+        )
+    boxes = []
+    for raw_box in raw_boxes:
+        if not isinstance(raw_box, list) or len(raw_box) != 4:
+            raise ValueError(
+                f"Invalid move-task footprint box in {path}: {raw_box!r}. "
+                f"Run `{MOVE_FOOTPRINT_GENERATOR_COMMAND}`."
+            )
+        try:
+            box = tuple(float(value) for value in raw_box)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Invalid move-task footprint box in {path}: {raw_box!r}. "
+                f"Run `{MOVE_FOOTPRINT_GENERATOR_COMMAND}`."
+            ) from exc
+        if not all(math.isfinite(value) for value in box) or box[0] >= box[2] or box[1] >= box[3]:
+            raise ValueError(
+                f"Invalid move-task footprint box in {path}: {raw_box!r}. "
+                f"Run `{MOVE_FOOTPRINT_GENERATOR_COMMAND}`."
+            )
+        boxes.append(box)
+    return tuple(boxes)
+
+
+def validate_move_episode_footprints(episodes: list[BenchmarkEpisodeSpec]) -> None:
+    """Require generated geometry for every object that can participate in a move task."""
+
+    move_object_names = sorted(
+        {
+            object_name
+            for episode in episodes
+            if episode.task_family == TASK_MOVE
+            for object_name in episode.objects
+        }
+    )
+    for object_name in move_object_names:
+        load_object_move_footprint_boxes(object_name)
 
 
 def _normalized_instruction(instruction: str) -> str:
@@ -364,6 +468,8 @@ def episode_spec_from_json(row: dict[str, Any], *, source: str = "JSONL row") ->
             raise ValueError(f"{source}: between episodes need a target and two distinct referents.")
         direction = None
     else:
+        if len(objects) != 4:
+            raise ValueError(f"{source}: move episodes must contain four objects.")
         if row_target_id is None and not mentions:
             raise ValueError(f"{source}: move instruction must mention the moved object.")
         target_id = row_target_id if row_target_id is not None else mentions[0]
@@ -408,4 +514,5 @@ def load_episode_jsonl(path: str | Path) -> list[BenchmarkEpisodeSpec]:
             episodes.append(episode_spec_from_json(row, source=f"{path}:{line_no}"))
     if not episodes:
         raise ValueError(f"{path}: JSONL file did not contain any benchmark episodes.")
+    validate_move_episode_footprints(episodes)
     return episodes

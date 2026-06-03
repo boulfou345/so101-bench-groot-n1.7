@@ -1,7 +1,7 @@
 # Copyright (c) 2022-2026, The Isaac Lab Project Developers.
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Run SO-101 Bench with a remote GR00T policy server."""
+"""Run SO-101 Bench with a remote MolmoAct2 policy server."""
 
 from __future__ import annotations
 
@@ -30,7 +30,7 @@ def _str_to_bool(value: str | bool) -> bool:
     raise argparse.ArgumentTypeError(f"Expected a boolean value, got {value!r}.")
 
 
-parser = argparse.ArgumentParser(description="SO-101 Bench GR00T remote-policy evaluator.")
+parser = argparse.ArgumentParser(description="SO-101 Bench MolmoAct2 remote-policy evaluator.")
 parser.add_argument("--disable_fabric", action="store_true", default=False, help="Disable fabric and use USD I/O.")
 parser.add_argument("--num_envs", type=int, default=None, help="Number of environments to simulate.")
 parser.add_argument("--task", type=str, default="So101Bench-Bin-v0", help="Isaac Lab task name.")
@@ -41,36 +41,47 @@ parser.add_argument(
     default=None,
     help="Optional number of JSONL episodes to evaluate. If omitted, evaluate every row.",
 )
-parser.add_argument("--policy_host", type=str, default="localhost", help="GR00T policy server host.")
-parser.add_argument("--policy_port", type=int, default=5555, help="GR00T policy server port.")
-parser.add_argument("--action_horizon", type=int, default=8, help="Action steps to execute per server query.")
+parser.add_argument("--policy_host", type=str, default="localhost", help="MolmoAct2 policy server host.")
+parser.add_argument("--policy_port", type=int, default=8000, help="MolmoAct2 policy server port.")
+parser.add_argument("--action_horizon", type=int, default=30, help="Action steps to execute per server query.")
+parser.add_argument(
+    "--policy_cameras",
+    type=str,
+    default="overhead,wrist",
+    help=(
+        "Comma-separated pair of sim cameras sent to MolmoAct2. The checkpoint was trained on two third-person "
+        "views, so '--policy_cameras overhead,overhead' is also useful for testing without the wrist camera."
+    ),
+)
+parser.add_argument(
+    "--policy_timeout_s",
+    type=float,
+    default=120.0,
+    help="HTTP timeout for MolmoAct2 health checks and inference requests.",
+)
+parser.add_argument(
+    "--num_steps",
+    type=int,
+    default=10,
+    help="MolmoAct2 continuous-flow solver iterations.",
+)
+parser.add_argument(
+    "--max_joint_step_deg",
+    type=float,
+    default=15.0,
+    help="Maximum sim joint-target change per control tick. Use 0 to disable the MolmoAct2 safety clamp.",
+)
 parser.add_argument(
     "--initial_hold_time_s",
     type=float,
     default=0.5,
-    help="Seconds to hold the initial joint pose before recording overhead_init and querying GR00T.",
+    help="Seconds to hold the initial joint pose before querying MolmoAct2.",
 )
 parser.add_argument(
     "--hold_init",
     action="store_true",
     default=False,
-    help="Continuously hold the robot at the initial joint pose without connecting to or querying GR00T.",
-)
-parser.add_argument(
-    "--remote_reset_each_episode",
-    dest="remote_reset_each_episode",
-    action="store_true",
-    default=True,
-    help=(
-        "Send the GR00T server reset endpoint before every new episode. Enabled by default so GR00T does not "
-        "carry hidden episode state or exhausted action chunks into the next reset."
-    ),
-)
-parser.add_argument(
-    "--no_remote_reset_each_episode",
-    dest="remote_reset_each_episode",
-    action="store_false",
-    help="Only clear local cached actions between episodes; useful for debugging a reset endpoint.",
+    help="Continuously hold the robot at the initial joint pose without connecting to or querying MolmoAct2.",
 )
 parser.add_argument(
     "--lang_instruction",
@@ -108,50 +119,16 @@ parser.add_argument(
     ),
 )
 parser.add_argument(
-    "--rename_map",
-    type=str,
-    default=None,
-    help=(
-        "JSON map from sim camera names to policy names. By default the sim wrist camera is sent as "
-        '\'front\' to match the SO100/SO101 real-robot GR00T scripts. Example: '
-        '\'{"wrist":"ego","overhead":"external"}\'.'
-    ),
-)
-parser.add_argument(
-    "--use_overhead_init",
-    nargs="?",
-    const=True,
-    default=True,
-    type=_str_to_bool,
-    help=(
-        "Send the settled overhead frame captured when robot control starts as video.overhead_init on every "
-        "GR00T request. "
-        "Accepts either '--use_overhead_init' or '--use_overhead_init true'."
-    ),
-)
-parser.add_argument(
-    "--overhead_init_key",
-    type=str,
-    default="overhead_init",
-    help="Policy video key for the fixed settled overhead frame used by WM-conditioned checkpoints.",
-)
-parser.add_argument(
-    "--overhead_init_camera",
-    type=str,
-    default="overhead",
-    help="Sim camera name to capture for the fixed overhead-init frame.",
-)
-parser.add_argument(
     "--policy_image_width",
     type=int,
     default=640,
-    help="Resize every policy video frame to this width before sending it to GR00T. Use 0 to disable resizing.",
+    help="Resize every policy image to this width before sending it to MolmoAct2. Use 0 to disable resizing.",
 )
 parser.add_argument(
     "--policy_image_height",
     type=int,
     default=480,
-    help="Resize every policy video frame to this height before sending it to GR00T. Use 0 to disable resizing.",
+    help="Resize every policy image to this height before sending it to MolmoAct2. Use 0 to disable resizing.",
 )
 parser.add_argument(
     "--inspect_initial_scene",
@@ -172,16 +149,10 @@ parser.add_argument(
     ),
 )
 parser.add_argument(
-    "--episode_skip_key",
-    type=str,
-    default="N",
-    help="Keyboard key in the Isaac window that skips to the next episode. Use an empty string to disable.",
-)
-parser.add_argument(
     "--camera_snapshot_dir",
     type=Path,
-    default=Path("logs/groot_eval_camera_snapshots"),
-    help="Directory for manual camera snapshots saved during GR00T evaluation.",
+    default=Path("logs/molmoact2_eval_camera_snapshots"),
+    help="Directory for manual camera snapshots saved during MolmoAct2 evaluation.",
 )
 parser.add_argument(
     "--camera_snapshot_stdin",
@@ -220,13 +191,13 @@ parser.add_argument(
 parser.add_argument(
     "--repo_id",
     type=str,
-    default="5hadytru/so101_bench_groot_eval",
+    default="5hadytru/so101_bench_molmoact2_eval",
     help="LeRobot dataset repo id used for local dataset metadata.",
 )
 parser.add_argument(
     "--repo_root",
     type=Path,
-    default=Path("data/lerobot/so101_bench_groot_eval"),
+    default=Path("data/lerobot/so101_bench_molmoact2_eval"),
     help="Local root directory for the optional LeRobot dataset.",
 )
 parser.add_argument(
@@ -336,7 +307,6 @@ from so101_bench.tasks.direct.so101_bench.so101_bench_env_cfg import (
     VALID_OBJECT_SPAWN_REGIONS,
     configure_env_cfg_for_object_pool,
 )
-from so101_bench.utils.groot import GR00TRemotePolicy
 from so101_bench.utils.lerobot_calibration import (
     LEROBOT_INITIAL_JOINT_POS,
     lerobot_pose_to_sim_joint_pos,
@@ -348,6 +318,7 @@ from so101_bench.utils.lerobot_dataset import (
     real_compatible_camera_sources,
     recording_images,
 )
+from so101_bench.utils.molmoact2 import MolmoAct2RemotePolicy
 
 ACTION_JOINT_NAMES = ("Rotation", "Pitch", "Elbow", "Wrist_Pitch", "Wrist_Roll", "Jaw")
 MULTI_RIGID_BODY_BIN_CLEARANCE_MARGIN_M = 0.5 * INCH
@@ -373,7 +344,7 @@ def _normalize_keyboard_key(key: str) -> str:
 def _matches_keyboard_key(event_name: str, key: str) -> bool:
     event_name = _normalize_keyboard_key(event_name)
     key = _normalize_keyboard_key(key)
-    return bool(key) and event_name in {key, f"KEY_{key}"}
+    return event_name in {key, f"KEY_{key}"}
 
 
 def _normalize_terminal_command(command: str) -> str:
@@ -387,13 +358,11 @@ class _RuntimeControls:
         self,
         snapshot_key: str,
         *,
-        skip_key: str,
         terminal_enabled: bool,
         snapshot_stdin_enabled: bool,
         debug: bool,
     ):
         self.snapshot_key = _normalize_keyboard_key(snapshot_key) if snapshot_key else ""
-        self.skip_key = _normalize_keyboard_key(skip_key) if skip_key else ""
         self.paused = False
         self._events: queue.SimpleQueue[str] = queue.SimpleQueue()
         self._input = None
@@ -404,7 +373,7 @@ class _RuntimeControls:
         self._terminal_enabled = terminal_enabled
         self._snapshot_stdin_enabled = snapshot_stdin_enabled
 
-        if self.snapshot_key or self.skip_key:
+        if self.snapshot_key:
             self._start_isaac_keyboard_listener()
         if terminal_enabled or snapshot_stdin_enabled:
             self._start_stdin_listener()
@@ -468,7 +437,7 @@ class _RuntimeControls:
 
             app_window = omni.appwindow.get_default_app_window()
             if app_window is None:
-                print("[WARN]: No Isaac app window found; Isaac keyboard shortcuts are unavailable.")
+                print("[WARN]: No Isaac app window found; camera snapshot keyboard shortcut is unavailable.")
                 return
 
             self._input = carb.input.acquire_input_interface()
@@ -478,12 +447,9 @@ class _RuntimeControls:
                 self._keyboard,
                 self._on_keyboard_event,
             )
-            if self.snapshot_key:
-                print(f"[INFO]: Press '{self.snapshot_key}' in the Isaac window to save all current camera images.")
-            if self.skip_key:
-                print(f"[INFO]: Press '{self.skip_key}' in the Isaac window to skip to the next episode.")
+            print(f"[INFO]: Press '{self.snapshot_key}' in the Isaac window to save all current camera images.")
         except Exception as exc:
-            print(f"[WARN]: Isaac keyboard shortcuts unavailable: {exc}")
+            print(f"[WARN]: Camera snapshot keyboard shortcut unavailable: {exc}")
 
     def _start_stdin_listener(self) -> None:
         if not sys.stdin or not sys.stdin.isatty():
@@ -519,9 +485,6 @@ class _RuntimeControls:
         if event.type == self._key_press_type and _matches_keyboard_key(event_name, self.snapshot_key):
             print(f"[INFO]: Camera snapshot key received from Isaac window: {event_name}")
             self._events.put("snapshot")
-        if event.type == self._key_press_type and _matches_keyboard_key(event_name, self.skip_key):
-            print(f"[INFO]: Episode skip key received from Isaac window: {event_name}")
-            self._events.put("skip_episode")
         return True
 
     def poll(self) -> tuple[int, bool]:
@@ -537,15 +500,15 @@ class _RuntimeControls:
             elif event == "pause":
                 if not self.paused:
                     self.paused = True
-                    print("[INFO]: GR00T eval paused. Type 'resume' then Enter to continue.")
+                    print("[INFO]: MolmoAct2 eval paused. Type 'resume' then Enter to continue.")
             elif event == "resume":
                 if self.paused:
                     self.paused = False
-                    print("[INFO]: GR00T eval resumed.")
+                    print("[INFO]: MolmoAct2 eval resumed.")
             elif event == "toggle_pause":
                 self.paused = not self.paused
                 state = "paused" if self.paused else "resumed"
-                print(f"[INFO]: GR00T eval {state}.")
+                print(f"[INFO]: MolmoAct2 eval {state}.")
             elif event == "skip_episode":
                 skip_requested = True
                 if self.paused:
@@ -645,7 +608,7 @@ def _write_image(path: Path, rgb: np.ndarray) -> Path:
 
 def _save_camera_snapshot(
     output_dir: Path,
-    policy: GR00TRemotePolicy,
+    policy: MolmoAct2RemotePolicy,
     visual_obs: dict,
     cameras: dict[str, dict[str, int]],
     episode_index: int,
@@ -678,13 +641,6 @@ def _instruction(env, override: str | None) -> str:
     if override:
         return override
     return getattr(env.unwrapped, "so101_bench_instruction", "Place each object in the plastic bin.")
-
-
-def _rename_map(raw_map: str | None) -> dict[str, str]:
-    rename_map = {"wrist": "front", "overhead": "overhead"}
-    if raw_map:
-        rename_map.update(json.loads(raw_map))
-    return rename_map
 
 
 def _timestamped_layout_path(episodes_jsonl: Path) -> Path:
@@ -1004,7 +960,7 @@ def _episode_end_reason(env, terminated, truncated, term_log: dict) -> str:
     return "unknown"
 
 
-def _begin_robot_control(env, policy: GR00TRemotePolicy, obs: dict, object_asset_names: list[str]) -> None:
+def _begin_robot_control(env, policy: MolmoAct2RemotePolicy, obs: dict, object_asset_names: list[str]) -> None:
     mark_benchmark_robot_start(
         env.unwrapped,
         object_asset_names=object_asset_names,
@@ -1035,22 +991,18 @@ def _restore_robot_initial_pose(env) -> None:
 
 
 def _reset_env(env) -> tuple[dict, dict]:
-    # Episode transitions may be requested while action inference is active.
-    # Isaac Lab keeps mutable articulation buffers across resets, so ensure reset
-    # does not create inference tensors that a later reset cannot update.
-    with torch.inference_mode(False):
-        obs, info = env.reset()
-        _restore_robot_initial_pose(env)
-        unwrapped = env.unwrapped
-        unwrapped.scene.write_data_to_sim()
-        unwrapped.sim.forward()
-        num_rerenders = getattr(unwrapped.cfg, "num_rerenders_on_reset", 0)
-        if unwrapped.sim.has_rtx_sensors() and num_rerenders > 0:
-            for _ in range(num_rerenders):
-                unwrapped.sim.render()
-        obs = unwrapped.observation_manager.compute(update_history=True)
-        unwrapped.obs_buf = obs
-        return obs, info
+    obs, info = env.reset()
+    _restore_robot_initial_pose(env)
+    unwrapped = env.unwrapped
+    unwrapped.scene.write_data_to_sim()
+    unwrapped.sim.forward()
+    num_rerenders = getattr(unwrapped.cfg, "num_rerenders_on_reset", 0)
+    if unwrapped.sim.has_rtx_sensors() and num_rerenders > 0:
+        for _ in range(num_rerenders):
+            unwrapped.sim.render()
+    obs = unwrapped.observation_manager.compute(update_history=True)
+    unwrapped.obs_buf = obs
+    return obs, info
 
 
 def _print_initial_scene(env, object_asset_names: list[str]) -> None:
@@ -1061,7 +1013,6 @@ def _print_initial_scene(env, object_asset_names: list[str]) -> None:
     reset_params = unwrapped.cfg.events.reset_benchmark_scene.params
     object_labels = reset_params.get("object_labels", OBJECT_LABELS)
     object_positions = benchmark_object_positions(unwrapped, object_asset_names)
-    multi_rigid_body_info = getattr(unwrapped, "_so101_multi_rigid_body_info", {}) or {}
     for object_id, asset_name in enumerate(object_asset_names):
         label = object_labels[object_id] if object_id < len(object_labels) else asset_name
         pos = object_positions[0, object_id].detach().cpu().tolist()
@@ -1071,20 +1022,6 @@ def _print_initial_scene(env, object_asset_names: list[str]) -> None:
             f"[INFO]: Initial {asset_name} / {label} ({state}): "
             f"x={pos[0]:.5f}, y={pos[1]:.5f}, z={pos[2]:.5f}"
         )
-        child_positions = []
-        for view_info in multi_rigid_body_info.get(asset_name, ()):
-            transforms = view_info["view"].get_transforms()
-            if not isinstance(transforms, torch.Tensor):
-                transforms = torch.as_tensor(transforms)
-            child_pos = transforms[0, :3].detach().cpu().tolist()
-            child_positions.append(child_pos)
-            print(
-                f"[INFO]: Initial {asset_name} child {view_info['rel_path']}: "
-                f"x={child_pos[0]:.5f}, y={child_pos[1]:.5f}, z={child_pos[2]:.5f}"
-            )
-        if len(child_positions) > 1:
-            separation = math.dist(child_positions[0], child_positions[1])
-            print(f"[INFO]: Initial {asset_name} child origin separation: {separation:.5f} m")
 
     bin_asset = unwrapped.scene["plastic_bin"]
     bin_pos = bin_asset.data.root_pos_w[0].detach().cpu().tolist()
@@ -1135,11 +1072,11 @@ def main():
     if initial_hold_steps > 0:
         print(f"[INFO]: Initial hold: {initial_hold_steps} steps ({initial_hold_steps * control_dt:.3f}s)")
     if args_cli.hold_init:
-        print("[INFO]: Hold-init mode enabled: GR00T policy connection and queries are disabled.")
+        print("[INFO]: Hold-init mode enabled: MolmoAct2 policy connection and queries are disabled.")
 
     cameras = _discover_cameras(env)
     if not cameras:
-        raise RuntimeError("No cameras were found. GR00T inference requires visual observations.")
+        raise RuntimeError("No cameras were found. MolmoAct2 inference requires visual observations.")
 
     if args_cli.inspect_initial_scene:
         _reset_env(env)
@@ -1172,13 +1109,8 @@ def main():
     else:
         print("[INFO]: LeRobot dataset recording disabled. Pass --record_dataset to enable it.")
 
-    rename_map = _rename_map(args_cli.rename_map)
-    print(f"[INFO]: Policy camera map: {rename_map}")
-    if args_cli.use_overhead_init:
-        print(
-            "[INFO]: WM overhead-init enabled: "
-            f"rgb_{args_cli.overhead_init_camera} -> video.{args_cli.overhead_init_key}"
-        )
+    policy_cameras = [name.strip() for name in args_cli.policy_cameras.split(",") if name.strip()]
+    print(f"[INFO]: MolmoAct2 policy cameras: {policy_cameras}")
     image_size = (
         (args_cli.policy_image_width, args_cli.policy_image_height)
         if args_cli.policy_image_width > 0 and args_cli.policy_image_height > 0
@@ -1188,18 +1120,18 @@ def main():
         print(f"[INFO]: Resizing policy video frames to {image_size[0]}x{image_size[1]}")
 
     sim_speed_ui = _SimClockRateWindow(control_dt=control_dt)
-    policy = GR00TRemotePolicy(
+    policy = MolmoAct2RemotePolicy(
         device=env.unwrapped.device,
         cameras=cameras,
         host=args_cli.policy_host,
         port=args_cli.policy_port,
         action_horizon=args_cli.action_horizon,
         lang_instruction=args_cli.lang_instruction or "Place each object in the plastic bin.",
-        rename_map=rename_map,
-        use_overhead_init=args_cli.use_overhead_init,
-        overhead_init_camera=args_cli.overhead_init_camera,
-        overhead_init_key=args_cli.overhead_init_key,
+        camera_names=policy_cameras,
         image_size=image_size,
+        timeout_s=args_cli.policy_timeout_s,
+        num_steps=args_cli.num_steps,
+        max_joint_step_deg=args_cli.max_joint_step_deg,
     )
     if not args_cli.hold_init:
         policy.connect()
@@ -1226,7 +1158,6 @@ def main():
     snapshot_index = 0
     runtime_controls = _RuntimeControls(
         args_cli.camera_snapshot_key,
-        skip_key=args_cli.episode_skip_key,
         terminal_enabled=args_cli.terminal_control_stdin,
         snapshot_stdin_enabled=args_cli.camera_snapshot_stdin,
         debug=args_cli.camera_snapshot_debug,
@@ -1293,7 +1224,7 @@ def main():
         sim_speed_ui.reset()
         _print_episode_setup(env)
         policy.set_language_instruction(_instruction(env, args_cli.lang_instruction))
-        policy.reset(reset_remote=args_cli.remote_reset_each_episode)
+        policy.reset()
         print(f"[INFO]: Episode instruction: {policy.lang_instruction}")
         hold_action = _initial_robot_action(env)
         actions[:] = hold_action
@@ -1309,7 +1240,7 @@ def main():
                 _cancel_recording()
                 episodes += 1
                 skipped += 1
-                print(f"[INFO]: Episode {episodes}/{episode_count}: skipped by control request.")
+                print(f"[INFO]: Episode {episodes}/{episode_count}: skipped by terminal command.")
                 if episodes >= episode_count:
                     _print_final_score()
                     break
@@ -1322,60 +1253,60 @@ def main():
                 time.sleep(0.02)
                 continue
 
-            if step < initial_hold_steps:
-                actions[:] = hold_action
-            else:
-                if args_cli.hold_init:
-                    if not robot_control_started:
-                        policy.set_episode_initial_observation(obs["visual"])
-                        robot_control_started = True
+            with torch.inference_mode():
+                if step < initial_hold_steps:
                     actions[:] = hold_action
                 else:
-                    if not robot_control_started:
-                        _begin_robot_control(env, policy, obs, object_asset_names)
-                        robot_control_started = True
-                    with torch.inference_mode():
+                    if args_cli.hold_init:
+                        if not robot_control_started:
+                            policy.set_episode_initial_observation(obs["visual"])
+                            robot_control_started = True
+                        actions[:] = hold_action
+                    else:
+                        if not robot_control_started:
+                            _begin_robot_control(env, policy, obs, object_asset_names)
+                            robot_control_started = True
                         joint_positions = obs["policy"]["joint_pos_obs"][0].clone()
                         actions[:] = policy.get_action(joint_positions, obs["visual"])
 
-            obs, _rewards, terminated, truncated, info = env.step(actions)
-            step += 1
-            sim_speed_ui.add_step()
-            _push_recording_frame()
+                obs, _rewards, terminated, truncated, info = env.step(actions)
+                step += 1
+                sim_speed_ui.add_step()
+                _push_recording_frame()
 
-            skip_requested = _poll_runtime_controls()
-            if skip_requested:
-                _cancel_recording()
+                skip_requested = _poll_runtime_controls()
+                if skip_requested:
+                    _cancel_recording()
+                    episodes += 1
+                    skipped += 1
+                    print(f"[INFO]: Episode {episodes}/{episode_count}: skipped by terminal command.")
+                    if episodes >= episode_count:
+                        _print_final_score()
+                        break
+                    _start_next_episode()
+                    continue
+
+                is_done = bool(terminated.any().item() or truncated.any().item())
+                if not is_done:
+                    continue
+
+                term_log = info.get("log", {})
+                is_success = bool(term_log.get("Episode_Termination/success", 0.0) > 0.0)
+                end_reason = _episode_end_reason(env, terminated, truncated, term_log)
+                _save_recording()
                 episodes += 1
-                skipped += 1
-                print(f"[INFO]: Episode {episodes}/{episode_count}: skipped by control request.")
+                successes += int(is_success)
+                episode_duration_s = step * control_dt
+                print(
+                    f"[INFO]: Episode {episodes}/{episode_count}: success={is_success}, "
+                    f"reason={end_reason}, length={episode_duration_s:.2f}s"
+                )
+
                 if episodes >= episode_count:
                     _print_final_score()
                     break
+
                 _start_next_episode()
-                continue
-
-            is_done = bool(terminated.any().item() or truncated.any().item())
-            if not is_done:
-                continue
-
-            term_log = info.get("log", {})
-            is_success = bool(term_log.get("Episode_Termination/success", 0.0) > 0.0)
-            end_reason = _episode_end_reason(env, terminated, truncated, term_log)
-            _save_recording()
-            episodes += 1
-            successes += int(is_success)
-            episode_duration_s = step * control_dt
-            print(
-                f"[INFO]: Episode {episodes}/{episode_count}: success={is_success}, "
-                f"reason={end_reason}, length={episode_duration_s:.2f}s"
-            )
-
-            if episodes >= episode_count:
-                _print_final_score()
-                break
-
-            _start_next_episode()
     finally:
         _cancel_recording()
         if recorder is not None:

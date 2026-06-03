@@ -5,10 +5,9 @@ from __future__ import annotations
 import math
 import os
 
-import numpy as np
-
 from isaacsim.core.utils.rotations import euler_angles_to_quat
 
+import numpy as np
 from pxr import Usd, UsdGeom
 
 import isaaclab.sim as sim_utils
@@ -20,13 +19,16 @@ from isaaclab.managers import ObservationTermCfg as ObsTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.scene import InteractiveSceneCfg
-from isaaclab.sensors import FrameTransformerCfg, TiledCameraCfg
+from isaaclab.sensors import ContactSensorCfg, FrameTransformerCfg, TiledCameraCfg
 from isaaclab.utils import configclass
 
 from so101_bench import assets, mdp
-from so101_bench.assets.so101 import SO101_CONTACT_GRASP_CFG
+from so101_bench.assets.so101 import SO101_CFG
 from so101_bench.benchmark import (
     BenchmarkEpisodeSpec,
+    FOUR_OBJECT_BIN_EPISODE_LENGTH_S,
+    MOVE_STRAIGHTNESS_TOLERANCE_M,
+    SPATIAL_SUCCESS_DISTANCE_M,
     TASK_BETWEEN,
     TASK_BIN,
     TASK_MIXED,
@@ -48,7 +50,7 @@ BEDROOM_TABLETOP_SCALE = (1.0, 1.0, 1.0)
 
 OBJECT_ASSET_NAMES = ["object_1", "object_2", "object_3", "object_4"]
 OBJECT_LABELS = ["blue bowl", "silver glasses", "yellow screwdriver", "black tape"]
-TABLE_BOUNDS = {"x": (-0.14, 0.25), "y": (-0.1, 0.175)}
+TABLE_BOUNDS = {"x": (-0.14, 0.25), "y": (-0.1, 0.155)}
 INACTIVE_OBJECT_BASE_POS = (20.06628, 20.0, -10.0)
 INACTIVE_OBJECT_SPACING = 0.25
 ROBOT_BASE_TRANSLATION = (0.05209, 0.18061, -0.03102)
@@ -60,7 +62,7 @@ OBJECT_FIXED_POSES = (
     (0.24228, 0.066, math.radians(90.0)),
 )
 
-BIN_FIXED_TRANSLATION = (-0.12917, -0.16276, -0.00124)
+BIN_FIXED_TRANSLATION = (-0.12917, -0.16276, 0.02)
 BIN_FIXED_YAW_DEG = -66.023
 BIN_ROOT_ROTATION_RPY_DEG = (-0.007, -0.009, 0.0)
 BIN_FIXED_POSE = (
@@ -69,12 +71,12 @@ BIN_FIXED_POSE = (
     math.radians(BIN_FIXED_YAW_DEG),
 )
 BIN_RANDOM_POSES_RPY_DEG = (
-    ((-0.12917, -0.16276, -0.00124), (0.0, 0.0, -66.023)),
-    ((-0.15984, -0.06498, -0.0012), (0.0, 0.0, -90.0)),
-    ((-0.15984, 0.02407, -0.0012), (0.0, 0.0, -90.0)),
-    ((0.37129, 0.03595, -0.0012), (0.0, 0.0, -90.0)),
-    ((0.37129, -0.07184, -0.0012), (0.0, 0.0, -90.0)),
-    ((0.32627, -0.17514, -0.0012), (0.0, 0.0, -120.541)),
+    ((-0.12917, -0.16276, 0.02), (0.0, 0.0, -66.023)),
+    ((-0.15984, -0.06498, 0.02), (0.0, 0.0, -90.0)),
+    ((-0.15984, 0.02407, 0.02), (0.0, 0.0, -90.0)),
+    ((0.37129, 0.03595, 0.02), (0.0, 0.0, -90.0)),
+    ((0.37129, -0.07184, 0.02), (0.0, 0.0, -90.0)),
+    ((0.32627, -0.17514, 0.02), (0.0, 0.0, -120.541)),
 )
 BIN_RANDOM_POSES = tuple(
     (translation, tuple(math.radians(angle) for angle in orientation_rpy_deg))
@@ -82,21 +84,33 @@ BIN_RANDOM_POSES = tuple(
 )
 
 VALID_OBJECT_SPAWN_REGIONS = [ # for each bin position, define a valid region for object spawning (as a counter-clockwise set of points for a polygon)
-    [(-.14, 0.175, 0.0), (-0.0512, 0.04475, 0.0), (0.01521, -0.099, 0.0), (0.25, -0.099, 0.0), (0.25, 0.175, 0.0), (0.20286, 0.175, 0.0), (0.20286, 0.05146, 0.0), (0.17055, 0.05146, 0.0), (0.17055, -0.0554, 0.0), (-0.0087, -0.0397, 0.0), (-0.0305, 0.05435, 0.0), (-0.067255, 0.175, 0.0)],
-    [(-0.000391, -0.045138, 0.0), (-0.000391, -0.099, 0.0), (0.25, -0.099, 0.0), (0.25, 0.175, 0.0), (0.20286, 0.175, 0.0), (0.20286, 0.05146, 0.0), (0.17055, 0.05146, 0.0), (0.17055, -0.0554, 0.0)],
-    [(-0.000391, -0.045138, 0.0), (-0.000391, -0.099, 0.0), (0.25, -0.099, 0.0), (0.25, 0.175, 0.0), (0.20286, 0.175, 0.0), (0.20286, 0.05146, 0.0), (0.17055, 0.05146, 0.0), (0.17055, -0.0554, 0.0)],
-    [(-.14, 0.175, 0.0), (-.1022, -0.084, 0.0), (0.211568, -0.099, -0.0), (0.211568, 0.008515, 0.0), (0.211568, 0.175, 0.0), (0.20286, 0.175, 0.0), (0.20286, 0.05146, 0.0), (0.17055, 0.05146, 0.0), (0.157788, -0.039903, 0.0), (-0.0305, -0.039903, 0.0), (-0.0305, 0.05435, 0.0), (-0.067693, 0.128006, 0.0), (-0.067693, 0.175, 0.0)],
-    [(-.14, 0.175, 0.0), (-.1022, -0.084, 0.0), (0.211568, -0.099, -0.0), (0.211568, 0.008515, 0.0), (0.211568, 0.175, 0.0), (0.20286, 0.175, 0.0), (0.20286, 0.05146, 0.0), (0.17055, 0.05146, 0.0), (0.157788, -0.039903, 0.0), (-0.0305, -0.039903, 0.0), (-0.0305, 0.05435, 0.0), (-0.067693, 0.128006, 0.0), (-0.067693, 0.175, 0.0)],
-    [(-.14, 0.175, 0.0), (-.1022, -0.084, 0.0), (0.186416, -0.099, -0.0), (0.25, 0.008515, 0.0), (0.25, 0.175, 0.0), (0.20286, 0.175, 0.0), (0.20286, 0.05146, 0.0), (0.17055, 0.05146, 0.0), (0.157788, -0.039903, 0.0), (-0.0305, -0.039903, 0.0), (-0.0305, 0.05435, 0.0), (-0.067693, 0.128006, 0.0), (-0.067693, 0.175, 0.0)],
+    [(-.11, 0.15, 0.0), (-0.0512, 0.04475, 0.0), (0.01521, -0.099, 0.0), (0.25, -0.099, 0.0), (0.25, 0.15, 0.0), (0.185, 0.15, 0.0), (0.147, 0.07, 0.0), (0.145, 0.05146, 0.0), (0.141, -0.004, 0.0), (0.01, -.0005, 0.0), (-0.047, 0.15, 0.0)],
+    [(-0.02, -0.008, 0.0), (-0.02, -0.099, 0.0), (0.25, -0.099, 0.0), (0.25, 0.15, 0.0), (0.19, 0.15, 0.0), (0.165, 0.09, 0.0), (0.14491, 0.053, 0.0), (0.137, -0.006, 0.0)],
+    [(-0.02, -0.008, 0.0), (-0.02, -0.099, 0.0), (0.25, -0.099, 0.0), (0.25, 0.15, 0.0), (0.19, 0.15, 0.0), (0.165, 0.09, 0.0), (0.14491, 0.053, 0.0), (0.137, -0.006, 0.0)],
+    [(-.11, 0.15, 0.0), (-.1022, -0.084, 0.0), (0.211568, -0.099, -0.0), (0.211568, 0.008515, 0.0), (0.211568, 0.15, 0.0), (0.185, 0.15, 0.0), (0.155, 0.08, 0.0), (0.155, 0.08, 0.0), (0.137, -0.01, 0.0), (0.015, -0.01, 0.0), (-0.0085, 0.05435, 0.0), (-0.043, 0.128006, 0.0), (-0.043, 0.15, 0.0)],
+    [(-.11, 0.15, 0.0), (-.1022, -0.084, 0.0), (0.211568, -0.099, -0.0), (0.211568, 0.008515, 0.0), (0.211568, 0.15, 0.0), (0.185, 0.15, 0.0), (0.155, 0.08, 0.0), (0.155, 0.08, 0.0), (0.137, -0.01, 0.0), (0.015, -0.01, 0.0), (-0.0085, 0.05435, 0.0), (-0.043, 0.128006, 0.0), (-0.043, 0.15, 0.0)],
+    [(-.11, 0.15, 0.0), (-.1022, -0.084, 0.0), (0.186416, -0.099, -0.0), (0.25, 0.008515, 0.0), (0.25, 0.15, 0.0), (0.185, 0.15, 0.0), (0.155, 0.08, 0.0), (0.155, 0.08, 0.0), (0.137, -0.01, 0.0), (0.015, -0.01, 0.0), (-0.0085, 0.05435, 0.0), (-0.043, 0.128006, 0.0), (-0.043, 0.15, 0.0)],
+]
+
+SO101_BOUNDING_BOX = [
+    (0.012, 0.241, 0.0),
+    (0.0113, 0.1267, 0.0),
+    (0.0437, 0.1262, 0.0),
+    (0.0431, 0.0182, 0.0),
+    (0.0939, 0.0179, 0.0),
+    (0.0939, 0.1262, 0.0),
+    (0.1256, 0.126, 0.0),
+    (0.1263, 0.2403, 0.0),
 ]
 
 MIN_RESET_TIME_S = 0.5
 MIN_FAILURE_TIME_S = 0.5
-SUCCESS_CONFIRM_TIME_S = 0.25
+SUCCESS_CONFIRM_TIME_S = 3.0
+CONTACT_GRACE_TIME_S = 0.5
 PHYSICS_DT = 1.0 / 240.0
 CONTROL_DT = 1.0 / 30.0
 CONTROL_DECIMATION = int(round(CONTROL_DT / PHYSICS_DT))
-CONTACT_OFFSET = 0.006
+CONTACT_OFFSET = 0.004
 REST_OFFSET = 0.0
 CONTACT_SOLVER_POSITION_ITERATIONS = 64
 CONTACT_SOLVER_VELOCITY_ITERATIONS = 4
@@ -158,7 +172,7 @@ def inactive_object_pos(object_id: int) -> tuple[float, float, float]:
 
 
 def _robot_cfg() -> ArticulationCfg:
-    cfg = SO101_CONTACT_GRASP_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
+    cfg = SO101_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
     cfg.init_state.pos = ROBOT_BASE_TRANSLATION
     cfg.init_state.rot = euler_angles_to_quat(np.array([0.0, 0.0, ROBOT_BASE_YAW_DEG]), degrees=True)
     return cfg
@@ -237,10 +251,12 @@ def _spawn_split_rigid_body_usd(
     rigid_props = cfg.rigid_props
     collision_props = cfg.collision_props
     mass_props = cfg.mass_props
+    activate_contact_sensors = cfg.activate_contact_sensors
 
     cfg.rigid_props = None
     cfg.collision_props = None
     cfg.mass_props = None
+    cfg.activate_contact_sensors = False
     try:
         prim = sim_utils.spawn_from_usd(
             prim_path,
@@ -253,6 +269,7 @@ def _spawn_split_rigid_body_usd(
         cfg.rigid_props = rigid_props
         cfg.collision_props = collision_props
         cfg.mass_props = mass_props
+        cfg.activate_contact_sensors = activate_contact_sensors
 
     for spawned_prim_path in sim_utils.find_matching_prim_paths(prim_path):
         _apply_split_rigid_body_physics(
@@ -262,6 +279,48 @@ def _spawn_split_rigid_body_usd(
             collision_props,
             mass_props,
         )
+        if activate_contact_sensors:
+            sim_utils.activate_contact_sensors(spawned_prim_path)
+    return prim
+
+
+def _patch_bin_visual_material(root_prim: Usd.Prim) -> None:
+    """Keep the Blender material look, but remove camera-hostile transparency."""
+
+    for prim in Usd.PrimRange(root_prim):
+        opacity_attr = prim.GetAttribute("inputs:opacity")
+        if opacity_attr.IsValid():
+            opacity_attr.ClearConnections()
+            opacity_attr.Set(1.0)
+        for attr_name in ("inputs:transmission", "inputs:transmission_weight"):
+            attr = prim.GetAttribute(attr_name)
+            if attr.IsValid():
+                attr.ClearConnections()
+                attr.Set(0.0)
+
+
+def _spawn_sensor_safe_bin_usd(
+    prim_path: str,
+    cfg: sim_utils.UsdFileCfg,
+    translation: tuple[float, float, float] | None = None,
+    orientation: tuple[float, float, float, float] | None = None,
+    **kwargs,
+) -> Usd.Prim:
+    """Spawn the bin USD and make its authored material opaque for camera sensors."""
+
+    prim = sim_utils.spawn_from_usd(
+        prim_path,
+        cfg,
+        translation=translation,
+        orientation=orientation,
+        **kwargs,
+    )
+
+    stage = sim_utils.get_current_stage()
+    for spawned_prim_path in sim_utils.find_matching_prim_paths(prim_path):
+        spawned_prim = stage.GetPrimAtPath(spawned_prim_path)
+        if spawned_prim.IsValid():
+            _patch_bin_visual_material(spawned_prim)
     return prim
 
 
@@ -317,6 +376,7 @@ def _object_spawn(
 
     return sim_utils.CuboidCfg(
         size=size,
+        activate_contact_sensors=True,
         rigid_props=_contact_rigid_props(MAX_OBJECT_LINEAR_VELOCITY, MAX_OBJECT_ANGULAR_VELOCITY),
         collision_props=_contact_collision_props(),
         mass_props=sim_utils.MassPropertiesCfg(mass=mass),
@@ -341,6 +401,7 @@ def _benchmark_object_cfg(object_id: int, object_name: str) -> RigidObjectCfg | 
     init_pos, init_yaw = _object_initial_pose(object_id)
     spawn_kwargs = {
         "usd_path": f"{ASSETS_PATH}/usd/objects/{object_usd_stem(object_name)}.usdc",
+        "activate_contact_sensors": True,
         "rigid_props": _contact_rigid_props(MAX_OBJECT_LINEAR_VELOCITY, MAX_OBJECT_ANGULAR_VELOCITY),
         "collision_props": _contact_collision_props(),
     }
@@ -354,6 +415,53 @@ def _benchmark_object_cfg(object_id: int, object_name: str) -> RigidObjectCfg | 
             rot=euler_angles_to_quat(np.array([0.0, 0.0, init_yaw]), degrees=False),
         ),
     )
+
+
+def _object_body_prim_paths(object_id: int, object_name: str) -> list[str]:
+    root_path = f"{{ENV_REGEX_NS}}/Object_{object_id + 1}"
+    child_names = object_rigid_body_child_names(object_name)
+    return [f"{root_path}/{child_name}" for child_name in child_names] if child_names else [root_path]
+
+
+def _object_contact_sensor_cfgs(object_names: list[str] | tuple[str, ...]) -> dict[str, ContactSensorCfg]:
+    """Create per-body sensors filtered to contacts with other tabletop objects only."""
+
+    body_paths_by_object = [
+        _object_body_prim_paths(object_id, object_name) for object_id, object_name in enumerate(object_names)
+    ]
+    sensor_cfgs = {}
+    for object_id, body_paths in enumerate(body_paths_by_object):
+        filter_paths = [
+            body_path
+            for other_object_id, other_body_paths in enumerate(body_paths_by_object)
+            if other_object_id != object_id
+            for body_path in other_body_paths
+        ]
+        if not filter_paths:
+            continue
+        for body_path in body_paths:
+            body_name = body_path.rsplit("/", maxsplit=1)[-1]
+            suffix = "" if body_name == f"Object_{object_id + 1}" else f"_{body_name}"
+            sensor_cfgs[f"object_{object_id + 1}{suffix}_contacts"] = ContactSensorCfg(
+                prim_path=body_path,
+                update_period=0.0,
+                filter_prim_paths_expr=filter_paths,
+            )
+    return sensor_cfgs
+
+
+def _configure_scene_object_contact_sensors(
+    scene_cfg: So101BenchSceneCfg,
+    object_names: list[str] | tuple[str, ...],
+) -> None:
+    for attr_name in list(scene_cfg.__dict__):
+        if attr_name.startswith("object_") and attr_name.endswith("_contacts"):
+            setattr(scene_cfg, attr_name, None)
+    for attr_name, sensor_cfg in _object_contact_sensor_cfgs(object_names).items():
+        setattr(scene_cfg, attr_name, sensor_cfg)
+
+
+_DEFAULT_OBJECT_CONTACT_SENSOR_CFGS = _object_contact_sensor_cfgs(OBJECT_LABELS)
 
 
 @configclass
@@ -395,6 +503,7 @@ class So101BenchSceneCfg(InteractiveSceneCfg):
             usd_path=f"{ASSETS_PATH}/usd/plastic_bin.usdc",
             rigid_props=_contact_rigid_props(MAX_BIN_LINEAR_VELOCITY, MAX_BIN_ANGULAR_VELOCITY),
             collision_props=_contact_collision_props(),
+            func=_spawn_sensor_safe_bin_usd,
         ),
         init_state=RigidObjectCfg.InitialStateCfg(
             pos=BIN_FIXED_TRANSLATION,
@@ -415,6 +524,10 @@ class So101BenchSceneCfg(InteractiveSceneCfg):
     object_2 = _benchmark_object_cfg(1, OBJECT_LABELS[1])
     object_3 = _benchmark_object_cfg(2, OBJECT_LABELS[2])
     object_4 = _benchmark_object_cfg(3, OBJECT_LABELS[3])
+    object_1_contacts = _DEFAULT_OBJECT_CONTACT_SENSOR_CFGS["object_1_contacts"]
+    object_2_contacts = _DEFAULT_OBJECT_CONTACT_SENSOR_CFGS["object_2_contacts"]
+    object_3_contacts = _DEFAULT_OBJECT_CONTACT_SENSOR_CFGS["object_3_contacts"]
+    object_4_contacts = _DEFAULT_OBJECT_CONTACT_SENSOR_CFGS["object_4_contacts"]
 
     camera_wrist = _camera_cfg(
         width=INNOMAKER_WRIST_CAMERA_WIDTH,
@@ -582,6 +695,7 @@ def configure_scene_objects(scene_cfg: So101BenchSceneCfg, object_names: list[st
     slot_labels = [*object_names, *OBJECT_LABELS[len(object_names) :]]
     for object_id, asset_name in enumerate(OBJECT_ASSET_NAMES):
         setattr(scene_cfg, asset_name, _benchmark_object_cfg(object_id, slot_labels[object_id]))
+    _configure_scene_object_contact_sensors(scene_cfg, slot_labels)
     return slot_labels
 
 
@@ -600,6 +714,7 @@ def configure_scene_object_pool(scene_cfg: So101BenchSceneCfg, object_names: lis
             setattr(scene_cfg, asset_name, _benchmark_object_cfg(object_id, object_names[object_id]))
         else:
             setattr(scene_cfg, asset_name, None)
+    _configure_scene_object_contact_sensors(scene_cfg, object_names)
     return asset_names
 
 
@@ -677,8 +792,6 @@ class EventCfg:
 class TerminationsCfg:
     """Paper-derived success and measurable failure terms."""
 
-    time_out = DoneTerm(func=mdp.time_out, time_out=True)
-
     success = DoneTerm(
         func=mdp.task_success,
         time_out=False,
@@ -688,7 +801,15 @@ class TerminationsCfg:
             "table_bounds": TABLE_BOUNDS,
             "min_episode_time_s": MIN_RESET_TIME_S,
             "confirm_time_s": SUCCESS_CONFIRM_TIME_S,
+            "contact_grace_time_s": CONTACT_GRACE_TIME_S,
+            "move_straightness_tolerance": MOVE_STRAIGHTNESS_TOLERANCE_M,
         },
+    )
+
+    time_out = DoneTerm(
+        func=mdp.task_time_out,
+        time_out=True,
+        params={"confirm_time_s": SUCCESS_CONFIRM_TIME_S},
     )
 
     failure = DoneTerm(
@@ -701,6 +822,8 @@ class TerminationsCfg:
             "ee_frame_cfg": SceneEntityCfg("ee_frame"),
             "min_episode_time_s": MIN_FAILURE_TIME_S,
             "displacement_baseline_time_s": MIN_FAILURE_TIME_S,
+            "move_straightness_tolerance": MOVE_STRAIGHTNESS_TOLERANCE_M,
+            "contact_grace_time_s": CONTACT_GRACE_TIME_S,
             "table_bounds": TABLE_BOUNDS,
         },
     )
@@ -722,7 +845,7 @@ class So101BenchEnvCfg(ManagerBasedRLEnvCfg):
 
     def __post_init__(self) -> None:
         self.decimation = CONTROL_DECIMATION
-        self.episode_length_s = 5.0
+        self.episode_length_s = FOUR_OBJECT_BIN_EPISODE_LENGTH_S
         self.scene.num_envs = 1
         self.sim.dt = PHYSICS_DT
         self.sim.render_interval = self.decimation

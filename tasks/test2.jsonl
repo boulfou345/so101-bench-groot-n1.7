@@ -1,1 +1,1 @@
-{"objects": ["yellow screwdriver", "cardboard box", "green shoes", "black pen"], "ood_key": "seen", "trial_id": 0, "n_objects": 4, "instruction": "Place each object in the plastic bin"}
+{"objects": ["grey toy car", "blue scissors", "pink eraser", "yellow screwdriver"], "ood_key": "seen", "trial_id": 0, "n_objects": 4, "instruction": "Place the pink eraser next to the blue scissors"}

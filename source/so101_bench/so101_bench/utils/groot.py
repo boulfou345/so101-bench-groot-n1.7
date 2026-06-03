@@ -409,6 +409,8 @@ class GR00TRemotePolicy:
         actions: list[dict[str, float]] = []
         for step in range(horizon):
             full = np.concatenate([single_arm[0][step], gripper[0][step]], axis=0)
+            if not np.isfinite(full).all():
+                raise ValueError(f"GR00T returned a non-finite action at chunk step {step}: {full.tolist()}")
             actions.append({joint: float(full[idx]) for idx, joint in enumerate(self.mapper.joint_order)})
         return actions
 
