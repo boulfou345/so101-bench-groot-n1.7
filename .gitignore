@@ -86,3 +86,5 @@ tasks/picker.jsonl
 data/
 
 checkpoints/
+# training checkpoints (large; not tracked)
+outputs/

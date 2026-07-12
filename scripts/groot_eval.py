@@ -44,7 +44,17 @@ parser.add_argument(
 )
 parser.add_argument("--policy_host", type=str, default="localhost", help="GR00T policy server host.")
 parser.add_argument("--policy_port", type=int, default=5555, help="GR00T policy server port.")
-parser.add_argument("--action_horizon", type=int, default=16, help="Action steps to execute per server query.")
+parser.add_argument(
+    "--action_horizon",
+    type=int,
+    default=16,
+    help=(
+        "Action steps executed per server query (replan cadence). Capped at the returned "
+        "chunk length. GR00T N1.7's native chunk is 40; set this to match your fine-tune's "
+        "intended cadence (16 mirrors the N1.6 WM baseline and is a safe default for any "
+        "chunk >= 16)."
+    ),
+)
 parser.add_argument(
     "--initial_hold_time_s",
     type=float,

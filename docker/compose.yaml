@@ -1,10 +1,11 @@
 # Docker Compose for the full SO-101 Bench demo: GR00T policy server + sim eval.
 #
-#   export GR00T_MODEL=~/workspace/so101_GR00T_N1.6-3B_WM_v7_50k
+#   export GR00T_MODEL=~/workspace/so101_GR00T_N1.7-3B_WM
 #   docker compose -f docker/compose.yaml up --build
 #
 # The sim service reaches the server at localhost:5555 via host networking.
-# Set GR00T_MODEL to the directory that contains checkpoint-52000/.
+# Set GR00T_MODEL to the directory that contains the N1.7 checkpoint dir
+# (e.g. checkpoint-XXXXX/); update the --model-path below to match.
 
 services:
   gr00t-server:
@@ -17,7 +18,8 @@ services:
     volumes:
       - ${GR00T_MODEL:?set GR00T_MODEL to the checkpoint parent dir}:/models:ro
     command: >
-      --model-path /models/checkpoint-52000
+      --model-path /models/checkpoint-XXXXX
+      --embodiment-tag NEW_EMBODIMENT
       --device cuda --host 0.0.0.0 --port 5555
 
   sim:

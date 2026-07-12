@@ -27,7 +27,7 @@ This repository contains:
 
 - the **Isaac Lab environment** (`source/so101_bench`) that recreates the bedroom
   tabletop, plastic bin, household objects, and the four benchmark task families;
-- **evaluation scripts** for running a GR00T-N1.6 (or MolmoAct2) policy in the
+- **evaluation scripts** for running a GR00T-N1.7 (or MolmoAct2) policy in the
   simulator and recording/scoring LeRobot datasets;
 - **teleoperation, replay, and offline scoring** tooling for building and grading
   simulated demonstration datasets;
@@ -44,6 +44,7 @@ This repository contains:
 - [Running in Docker](#running-in-docker)
 - [Quickstart / smoke tests](#quickstart--smoke-tests)
 - [GR00T inference with `groot_eval.py`](#gr00t-inference-with-groot_evalpy)
+- [Fine-tuning GR00T-N1.7](#fine-tuning-gr00t-n17)
 - [Downloading the USD assets](#downloading-the-usd-assets)
 - [Adding an asset and computing its footprint polygon](#adding-an-asset-and-computing-its-footprint-polygon)
 - [Teleoperation with an Xbox controller](#teleoperation-with-an-xbox-controller)
@@ -219,7 +220,7 @@ torch/transformers pins conflict:
 
 - **`so101-bench`** (`docker/Dockerfile`) — Isaac Lab sim + eval client (smoke tests,
   teleop, replay, scoring, `groot_eval.py`).
-- **`gr00t-server`** (`docker/gr00t-server/Dockerfile`) — the GR00T-N1.6 policy
+- **`gr00t-server`** (`docker/gr00t-server/Dockerfile`) — the GR00T-N1.7 policy
   server on `:5555` (reference image; the checkpoint is mounted, never baked).
 
 `docker/so101.sh` is a one-line dispatcher for the common actions:
@@ -234,7 +235,7 @@ torch/transformers pins conflict:
 Or bring up the full demo (policy server + sim, wired together) with compose:
 
 ```bash
-export GR00T_MODEL=~/workspace/so101_GR00T_N1.6-3B_WM_v7_50k   # dir with checkpoint-52000/
+export GR00T_MODEL=~/workspace/so101_GR00T_N1.7-3B_WM   # dir with the N1.7 checkpoint-XXXXX/
 docker compose -f docker/compose.yaml up --build
 ```
 
@@ -284,33 +285,52 @@ Inspect the first JSONL episode's initial scene without stepping physics:
 
 ## GR00T inference with `groot_eval.py`
 
-`scripts/groot_eval.py` evaluates a GR00T-N1.6 policy server against a task file in
+`scripts/groot_eval.py` evaluates a GR00T-N1.7 policy server against a task file in
 the digital twin, optionally recording a LeRobot dataset of the rollouts.
 
-### 1. Download the policy
+The ZMQ/msgpack wire contract (observation `video.*` / `state.single_arm` /
+`state.gripper` / `annotation.human.task_description`, action `single_arm` /
+`gripper`) is a GR00T convention that the Isaac-GR00T server maps from the
+checkpoint's modality config, so the SO-101 client is unchanged from N1.6 to N1.7 —
+the difference is the server image (Qwen3-VL backbone) and the checkpoint.
 
-The benchmark checkpoint is hosted on Hugging Face at
-**[`5hadytru/so101_GR00T_N1.6-3B_WM_v7_50k`](https://huggingface.co/5hadytru/so101_GR00T_N1.6-3B_WM_v7_50k)**.
-This is the *working-memory (WM)* fine-tune: in addition to the live wrist/overhead
-frames it conditions on the settled overhead frame captured at the start of the
-episode (`overhead_init`), the simple working-memory baseline from the paper.
+### 1. Get an N1.7 WM checkpoint
 
-```bash
-huggingface-cli download 5hadytru/so101_GR00T_N1.6-3B_WM_v7_50k \
-  --local-dir ~/workspace/so101_GR00T_N1.6-3B_WM_v7_50k
-```
+There is no public N1.7 SO-101 checkpoint yet — you must **fine-tune one first** from
+base model `nvidia/GR00T-N1.7-3B` on the SO-101 sim teleop dataset
+[`5hadytru/so101_bench_sim_1`](https://huggingface.co/datasets/5hadytru/so101_bench_sim_1)
+(480 episodes, `so101_follower`, `front` + `overhead` cameras).
+
+A runnable fine-tuning recipe using LeRobot's `lerobot-train` (`GrootPolicy`,
+`new_embodiment`, `chunk_size=16`) lives in **[`finetune/`](finetune/README.md)** —
+see `finetune/finetune_groot_n1.7.sh`.
+
+> [!NOTE]
+> `lerobot-train` produces a **LeRobot-format** checkpoint, which NVIDIA's Isaac-GR00T
+> ZMQ server below **cannot load directly** — evaluate a LeRobot-trained checkpoint with
+> LeRobot's own `lerobot-eval` / `lerobot-rollout` (see `finetune/README.md`). The ZMQ
+> server path below expects an Isaac-GR00T-format checkpoint (e.g. from NVIDIA's own
+> N1.7 finetune recipe). Also note the WM `overhead_init` conditioning needs a dataset
+> augmentation step described in `finetune/README.md`.
+
+> To validate the plumbing before a fine-tune exists, you can point the server at the
+> base `nvidia/GR00T-N1.7-3B` — the server boots and returns actions, but expect no
+> task success and a warning about the missing `overhead_init` modality.
 
 ### 2. Start the GR00T policy server
 
 The server ships with NVIDIA's [Isaac-GR00T](https://github.com/NVIDIA/Isaac-GR00T)
 codebase. Run it **from the Isaac-GR00T repo root, in that repo's own Python
 environment** (the `gr00t/eval/run_gr00t_server.py` path is relative to it), pointing
-at the downloaded checkpoint:
+at your fine-tuned checkpoint. N1.7's Cosmos-Reason2 / Qwen3-VL backbone needs a
+Qwen3-VL-capable `transformers` (Isaac-GR00T pins `4.57.x` for N1.7 — this is the N1.7
+counterpart of the old N1.6 Eagle3-VL `transformers==4.51.3`); see
+`docker/gr00t-server/Dockerfile`.
 
 ```bash
 cd ~/Isaac-GR00T
 python gr00t/eval/run_gr00t_server.py \
-  --model-path ~/workspace/so101_GR00T_N1.6-3B_WM_v7_50k/checkpoint-52000/ \
+  --model-path ~/workspace/so101_GR00T_N1.7-3B_WM/checkpoint-XXXXX/ \
   --embodiment-tag NEW_EMBODIMENT \
   --device cuda \
   --host 127.0.0.1 \
@@ -357,8 +377,9 @@ Notable flags:
   sampling new ones. When omitted, feasible layouts are sampled and saved to a
   timestamped file under `tasks/layouts/` that you can pass back to reproduce a run.
 - `--num_episodes N` — evaluate only the first `N` rows (default: all).
-- `--action_horizon` — action steps executed per server query (16 matches the WM
-  checkpoint above).
+- `--action_horizon` — action steps executed per server query (replan cadence), capped
+  at the returned chunk length. N1.7's native chunk is 40; set this to match your
+  fine-tune (16 is a safe default that mirrors the N1.6 WM cadence).
 - `--use_overhead_init true` — send the settled `overhead_init` frame each request
   (required for WM-conditioned checkpoints).
 - `--lang_instruction "..."` — override the policy language with a fixed string
@@ -375,6 +396,32 @@ to the next episode (these can also be typed into the launch terminal).
 `scripts/launch_groot_eval.sh` shows a full recording sweep at action horizons 8 and
 16.
 
+### GUI quick launch
+
+`scripts/launch_groot_eval_gui.sh` runs the evaluator command above **with the Isaac
+Sim window** (no `--headless`) against the server on `localhost:5555`. Extra flags
+are passed through to `groot_eval.py`:
+
+```bash
+./scripts/launch_groot_eval_gui.sh --num_episodes 5
+```
+
+Keep `--num_episodes` small for interactive runs: without it the evaluator
+pre-samples layouts for **all** rows in the task file before the window opens
+(~8–14 s/episode for `real_gr00t_WM_combined.jsonl`'s 281 rows), and the memory
+growth during that phase can get the process OOM-killed.
+
+Two setup pitfalls that surface on this path:
+
+- **`NotImplementedError: so101_bench.utils.lerobot_dataset is missing`** — the
+  Isaac env's editable `so101_bench` install points at a different clone whose
+  `lerobot_dataset.py` is the published placeholder. Reinstall from this repo:
+  `~/IsaacLab/isaaclab.sh -p -m pip install -e source/so101_bench`.
+- **`FileNotFoundError: USD file not found ... assets/usd/SO-ARM101-USD.usd`** —
+  asset paths resolve inside whichever clone is installed, so this repo needs its
+  own `assets/usd/` (see [Downloading the USD assets](#downloading-the-usd-assets)),
+  or a symlink to an existing download.
+
 ### The dataset
 
 The current demonstration dataset is
@@ -383,6 +430,91 @@ The current demonstration dataset is
 combines the real SO-101 teleoperation data used to fine-tune GR00T-N1.6-3B with
 simulated demonstrations collected in this digital twin, and is the dataset the
 recording defaults are kept compatible with.
+
+---
+
+## Fine-tuning GR00T-N1.7
+
+The full recipe lives in [`finetune/`](finetune/README.md); the entry point is
+`finetune/finetune_groot_n1.7.sh` (LeRobot `lerobot-train`, `GrootPolicy`). It runs
+in the **N1.7 LeRobot environment** (module `groot_n1_7`, transformers 5.x), *not*
+the Isaac Lab env — the script preflight-checks this and refuses to run on an N1.5
+(Eagle-backbone) LeRobot build. One external prerequisite: the training HF account
+must have accepted the gated [`nvidia/Cosmos-Reason2-2B`](https://huggingface.co/nvidia/Cosmos-Reason2-2B)
+backbone repo.
+
+```bash
+# from the repo root, inside the N1.7 lerobot venv:
+BATCH_SIZE=8 ./finetune/finetune_groot_n1.7.sh
+```
+
+### Reference configuration
+
+The configuration below (the script's defaults) produced a converged run on a single
+RTX PRO 6000 (~36 GB VRAM, ~90 min): loss 1.114 → 0.137 (5k) → 0.098 (10k) →
+0.082 (15k) → **0.065 (20k)**.
+
+**Model & data**
+
+| Parameter | Value |
+|---|---|
+| Base model | `nvidia/GR00T-N1.7-3B` (Cosmos-Reason2 / Qwen3-VL backbone) |
+| Dataset | `5hadytru/so101_bench_sim_1` (480 teleop episodes, 173,612 frames, 30 fps, `front` + `overhead`) |
+| Embodiment tag | `new_embodiment` |
+| Image augmentation | `dataset.image_transforms.enable=true` |
+
+**Trainable components** — the VLM is frozen; only the action pathway trains
+(no LoRA, `lora_rank=0`):
+
+| Component | Trained |
+|---|:---:|
+| LLM backbone (`tune_llm`) | ❌ |
+| Vision encoder (`tune_visual`) | ❌ |
+| Projector (`tune_projector`) | ✅ |
+| Diffusion action head (`tune_diffusion_model`) | ✅ |
+
+**Action space**
+
+| Parameter | Value |
+|---|---|
+| `chunk_size` / `n_action_steps` | 16 (keep in sync with eval `--action_horizon`) |
+| `use_relative_actions` | `true` (joint deltas) |
+| `relative_exclude_joints` | `["gripper"]` (gripper absolute) |
+
+**Optimization**
+
+| Parameter | Value |
+|---|---|
+| Optimizer | AdamW, lr `1e-4`, weight decay `1e-5`, betas (0.9, 0.999), grad clip 1.0 |
+| LR schedule | cosine, 500 warmup steps (5%) |
+| Precision | bf16 |
+| Batch size / steps | 8 / 20,000 (reference recipe's 64 needs multi-GPU) |
+| Checkpoint every | 5,000 steps |
+| Seed | 42 |
+
+All knobs are env-var overridable (`STEPS`, `BATCH_SIZE`, `DATASET`, `CHUNK_SIZE`,
+`RELATIVE_ACTIONS`, `WANDB_ENABLE`, `PUSH_TO_HUB`/`REPO_ID`, …); multi-GPU goes
+through `finetune/finetune_groot_n1.7_multigpu.sh` (`NUM_GPUS`, FSDP via
+`ACCELERATE_ARGS`). For the paper's WM-conditioned variant, first augment the
+dataset with `finetune/add_overhead_init.py`, then train on the augmented set and
+evaluate with `--use_overhead_init true`.
+
+### Evaluating the fine-tune in the twin
+
+`lerobot-train` writes a **LeRobot-format** checkpoint, which NVIDIA's ZMQ server
+cannot load. Instead, `finetune/zmq_bridge_server.py` serves the LeRobot checkpoint
+over the same wire contract `groot_eval.py` speaks. The single-command GUI path:
+
+```bash
+./scripts/launch_groot_n17_gui.sh --num_episodes 5
+```
+
+This auto-starts the bridge on `:5556` (if not already up), waits for the
+checkpoint to load, then launches the evaluator with the Isaac Sim window,
+recording to a timestamped `data/lerobot/groot_n17_gui_<timestamp>` dataset.
+Checkpoint, port, and paths are overridable via `N17_CKPT`, `BRIDGE_PORT`,
+`N17_VENV_PY`, `REPO_ROOT`. See [`finetune/EVAL_RUN.md`](finetune/EVAL_RUN.md) for
+a worked evaluation report of the 20k checkpoint.
 
 ---
 

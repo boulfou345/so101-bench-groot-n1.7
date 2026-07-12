@@ -45,7 +45,7 @@ Everything below is the underlying long-form equivalents.
 | Image | What it is | Env |
 |-------|-----------|-----|
 | **`so101-bench`** (`docker/Dockerfile`) | Isaac Lab sim + eval client (this repo). Runs smoke tests, teleop, replay, scoring, and `groot_eval.py`. | Isaac Lab / numpy 1.26.4 |
-| **`gr00t-server`** (`docker/gr00t-server/Dockerfile`) | GR00T-N1.6 policy server on `:5555`. *Reference* — needs the checkpoint mounted. | cu128 torch / transformers 4.51.3 |
+| **`gr00t-server`** (`docker/gr00t-server/Dockerfile`) | GR00T-N1.7 policy server on `:5555`. *Reference* — needs the checkpoint mounted. | cu128 torch / transformers 4.57.3 |
 
 They are **separate** because their torch/transformers pins conflict — the whole reason
 bringing this up natively was fiddly.
@@ -55,8 +55,8 @@ bringing this up natively was fiddly.
 ## Quick start (full demo via compose)
 
 ```bash
-# Point at the directory that contains checkpoint-52000/
-export GR00T_MODEL=~/workspace/so101_GR00T_N1.6-3B_WM_v7_50k
+# Point at the directory that contains the N1.7 checkpoint-XXXXX/
+export GR00T_MODEL=~/workspace/so101_GR00T_N1.7-3B_WM
 export HF_TOKEN=hf_...        # optional, for gated asset/model downloads
 
 docker compose -f docker/compose.yaml up --build
@@ -109,9 +109,10 @@ already runs `xhost +local:root`).
 ```bash
 docker build -t gr00t-server:latest -f docker/gr00t-server/Dockerfile .
 docker run --rm -it --gpus all --network=host \
-  -v ~/workspace/so101_GR00T_N1.6-3B_WM_v7_50k:/models:ro \
+  -v ~/workspace/so101_GR00T_N1.7-3B_WM:/models:ro \
   gr00t-server:latest \
-  --model-path /models/checkpoint-52000 --device cuda --host 0.0.0.0 --port 5555
+  --model-path /models/checkpoint-XXXXX --embodiment-tag NEW_EMBODIMENT \
+  --device cuda --host 0.0.0.0 --port 5555
 ```
 
 Wait for `Server is ready and listening on tcp://0.0.0.0:5555`.
@@ -127,8 +128,9 @@ These reproduce the fixes documented in `../SETUP_FIXES.md`:
 - **lerobot installed `--no-deps`** under a constraints file — a bare install drags
   numpy past 2.0.
 - **ffmpeg** — required for LeRobot video (`--record_dataset`).
-- **GR00T server: cu128 torch + transformers 4.51.3** — Blackwell `sm_120` support and
-  the checkpoint's Eagle3-VL `VideoInput` import.
+- **GR00T server: cu128 torch + transformers 4.57.3** — Blackwell `sm_120` support and
+  the Qwen3-VL backbone that GR00T N1.7's Cosmos-Reason2 processor needs (the N1.7
+  counterpart of the old N1.6 Eagle3-VL `transformers==4.51.3` pin).
 
 ## Notes / caveats
 
